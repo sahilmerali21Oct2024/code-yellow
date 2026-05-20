@@ -1,0 +1,6 @@
+dash-bootstrap-components
+psycopg2-binary
+plotly
+pandas
+databricks-sdk
+requests
