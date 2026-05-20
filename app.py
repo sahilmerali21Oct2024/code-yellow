@@ -496,18 +496,89 @@ html, body {{
 }}
 .filter-banner__clear:hover {{ background: var(--ach-purple); color: white; }}
 
-/* ── INCIDENT TABLE ──────────────────────────────────── */
-.incidents-table {{ width: 100%; font-size: 0.82rem; border-collapse: collapse; }}
-.incidents-table thead th {{
-  text-align: left; font-weight: 700; color: var(--text-muted);
-  font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase;
-  padding: 8px 8px; border-bottom: 2px solid var(--border-subtle);
+/* ── INCIDENT CARDS (expandable) ─────────────────────── */
+.inc-list {{ display: flex; flex-direction: column; gap: 6px; }}
+.inc-card {{
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--bg-card);
+  transition: box-shadow 120ms ease, border-color 120ms ease;
+  overflow: hidden;
 }}
-.incidents-table tbody td {{
-  padding: 9px 8px; border-bottom: 1px solid #F1F3F5;
-  vertical-align: middle;
+.inc-card:hover {{
+  border-color: #D8C7EE;
+  box-shadow: 0 2px 6px rgba(92,45,145,0.08);
 }}
-.incidents-table tbody tr:hover {{ background: #FAFAFC; }}
+.inc-card[open] {{
+  border-color: var(--ach-purple);
+  box-shadow: 0 4px 14px rgba(92,45,145,0.10);
+}}
+.inc-card__summary {{
+  list-style: none;
+  cursor: pointer;
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: 18px 110px 110px 1fr 40px 70px;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.85rem;
+  user-select: none;
+}}
+.inc-card__summary::-webkit-details-marker {{ display: none; }}
+.inc-card__chevron {{
+  display: inline-block;
+  color: var(--ach-purple);
+  font-size: 0.9rem;
+  transition: transform 150ms ease;
+}}
+.inc-card[open] .inc-card__chevron {{ transform: rotate(90deg); }}
+.inc-card__num  {{ font-weight: 700; color: var(--ach-purple); }}
+.inc-card__pill {{ justify-self: start; }}
+.inc-card__desc {{
+  color: var(--text-primary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}}
+.inc-card__pri  {{ font-weight: 700; color: var(--text-muted); text-align: center; }}
+.inc-card__time {{ color: var(--text-muted); font-size: 0.8rem; text-align: right; }}
+
+.inc-detail__grid {{
+  border-top: 1px dashed var(--border-subtle);
+  background: #FAFBFD;
+  padding: 12px 14px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 18px;
+  row-gap: 6px;
+  font-size: 0.82rem;
+}}
+.inc-detail__row {{
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  gap: 8px;
+  padding: 3px 0;
+  border-bottom: 1px solid #EEF0F3;
+  align-items: start;
+}}
+.inc-detail__label {{
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-weight: 700;
+  padding-top: 1px;
+}}
+.inc-detail__value {{
+  color: var(--text-primary);
+  word-break: break-word;
+}}
+@media (max-width: 1200px) {{
+  .inc-detail__grid {{ grid-template-columns: 1fr; }}
+}}
+@media (max-width: 700px) {{
+  .inc-card__summary {{ grid-template-columns: 18px 1fr 60px; gap: 6px; }}
+  .inc-card__pill, .inc-card__pri, .inc-card__time {{ display: none; }}
+}}
+
 .empty-state {{
   text-align: center; padding: 36px 12px; color: var(--text-muted); font-size: 0.9rem;
 }}
@@ -615,7 +686,8 @@ app.layout = html.Div([
 
         dbc.Row([
             dbc.Col(html.Div([
-                html.Div(html.H6("MTTR by Unit — Last 30 Days", id="mttr-title", className="panel__title"),
+                html.Div(html.H6("Mean Time To Resolve (MTTR) — by Unit · Last 30 Days",
+                                 id="mttr-title", className="panel__title"),
                          className="panel__header"),
                 html.Div(dcc.Graph(id="mttr-chart", config={"displayModeBar": False}), className="panel__body"),
             ], className="panel"), md=7, className="mb-3"),
@@ -671,26 +743,69 @@ app.layout = html.Div([
 # ─────────────────────────────────────────────────────────────────────────────
 # CALLBACKS
 # ─────────────────────────────────────────────────────────────────────────────
-def render_incident_table(incidents):
-    rows = []
-    for inc in incidents:
-        tier = inc["clinical_impact_tier"]
-        rows.append(html.Tr([
-            html.Td(html.Strong(inc["number"])),
-            html.Td((inc.get("short_description") or "")[:55]),
-            html.Td(html.Span(tier.replace("-", " ").title(), className=f"tier-pill tier-pill--{tier}")),
-            html.Td(inc.get("location_name") or "\u2014"),
-            html.Td(inc.get("assignment_group") or "\u2014"),
-            html.Td(f"P{inc.get('priority', '?')}"),
-            html.Td(inc.get("time_open", "\u2014")),
-        ]))
-    return html.Table([
-        html.Thead(html.Tr([
-            html.Th("INC#"), html.Th("Description"), html.Th("Impact"),
-            html.Th("Unit"), html.Th("Group"), html.Th("Pri"), html.Th("Open"),
-        ])),
-        html.Tbody(rows),
-    ], className="incidents-table")
+def _fmt(value, dash="\u2014"):
+    if value is None or value == "":
+        return dash
+    return str(value)
+
+
+def _fmt_dt(value, dash="\u2014"):
+    if not value:
+        return dash
+    try:
+        if hasattr(value, "strftime"):
+            return value.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        pass
+    return str(value)
+
+
+def render_incident_card(inc):
+    tier = inc["clinical_impact_tier"]
+    detail_rows = [
+        ("Incident #",          _fmt(inc.get("number"))),
+        ("Short description",   _fmt(inc.get("short_description"))),
+        ("Clinical impact",     tier.replace("-", " ").title()),
+        ("Priority",            f"P{_fmt(inc.get('priority'))}"),
+        ("Impact",              _fmt(inc.get("impact"))),
+        ("Urgency",             _fmt(inc.get("urgency"))),
+        ("Category",            _fmt(inc.get("category"))),
+        ("Assignment group",    _fmt(inc.get("assignment_group"))),
+        ("Location",            _fmt(inc.get("location_name"))),
+        ("Mapped unit",         _fmt(UNIT_NAME_BY_ID.get(inc.get("affected_unit")) if inc.get("affected_unit") else None)),
+        ("CI name",             _fmt(inc.get("ci_name"))),
+        ("Clinical CI",         _fmt(inc.get("is_clinical"))),
+        ("Service tier",        _fmt(inc.get("service_tier"))),
+        ("Patient-safety flag", _fmt(inc.get("u_patient_safety_impact"))),
+        ("Clinical-impact tag", _fmt(inc.get("u_clinical_impact"))),
+        ("Opened",              _fmt_dt(inc.get("opened_at"))),
+        ("Time open",           _fmt(inc.get("time_open"))),
+        ("sys_id",              _fmt(inc.get("sys_id"))),
+    ]
+    details = html.Div(
+        [html.Div([html.Span(label, className="inc-detail__label"),
+                   html.Span(value, className="inc-detail__value")],
+                  className="inc-detail__row") for label, value in detail_rows],
+        className="inc-detail__grid",
+    )
+    summary = html.Summary([
+        html.Span("\u25B8", className="inc-card__chevron"),
+        html.Span(inc.get("number") or "—", className="inc-card__num"),
+        html.Span(tier.replace("-", " ").title(), className=f"tier-pill tier-pill--{tier} inc-card__pill"),
+        html.Span((inc.get("short_description") or "")[:70], className="inc-card__desc"),
+        html.Span(f"P{_fmt(inc.get('priority'))}", className="inc-card__pri"),
+        html.Span(inc.get("time_open") or "—", className="inc-card__time"),
+    ], className="inc-card__summary")
+    return html.Details([summary, details], className="inc-card")
+
+
+def render_incidents_list(incidents):
+    if not incidents:
+        return html.Div("No active incidents.", className="empty-state")
+    return html.Div(
+        [render_incident_card(i) for i in incidents],
+        className="inc-list",
+    )
 
 
 def render_filter_banner(selected_unit, total_visible, total_overall):
@@ -735,13 +850,12 @@ def refresh_data(_n, selected_unit):
 
     visible_incidents = [i for i in incidents if (not selected_unit or i.get("affected_unit") == selected_unit)]
     if visible_incidents:
-        table = render_incident_table(visible_incidents)
+        table = render_incidents_list(visible_incidents)
+    elif selected_unit:
+        table = html.Div(f"No active incidents for {UNIT_NAME_BY_ID.get(selected_unit, selected_unit)}.",
+                         className="empty-state")
     else:
-        if selected_unit:
-            msg = f"No active incidents for {UNIT_NAME_BY_ID.get(selected_unit, selected_unit)}."
-        else:
-            msg = "No active incidents."
-        table = html.Div(msg, className="empty-state")
+        table = html.Div("No active incidents.", className="empty-state")
 
     banner, clear_btn_style = render_filter_banner(selected_unit, len(visible_incidents), len(incidents))
 
@@ -848,7 +962,7 @@ def _empty_mttr_fig(message):
      Input("selected-unit-store", "data")],
 )
 def update_mttr_chart(_n, selected_unit):
-    base_title = "MTTR by Unit — Last 30 Days"
+    base_title = "Mean Time To Resolve (MTTR) — by Unit · Last 30 Days"
     try:
         data = get_mttr_by_unit()
     except Exception as e:
@@ -864,7 +978,7 @@ def update_mttr_chart(_n, selected_unit):
     title = base_title
     if selected_unit:
         unit_name = UNIT_NAME_BY_ID.get(selected_unit, selected_unit)
-        title = f"MTTR — {unit_name} · Last 30 Days"
+        title = f"Mean Time To Resolve (MTTR) — {unit_name} · Last 30 Days"
         df = df[df["unit_id"] == selected_unit]
         if df.empty:
             return _empty_mttr_fig(f"No resolved incidents for {unit_name} in the last 30 days"), title
@@ -872,7 +986,9 @@ def update_mttr_chart(_n, selected_unit):
     color_col = "location_name"
     fig = px.line(
         df, x="resolve_date", y="mttr_hours", color=color_col,
-        labels={"resolve_date": "Date", "mttr_hours": "MTTR (hours)", "location_name": "Location"},
+        labels={"resolve_date": "Date",
+                "mttr_hours": "Mean Time To Resolve (hours)",
+                "location_name": "Location"},
         template="plotly_white",
         color_discrete_sequence=[PURPLE, TEAL, GREEN, ORANGE_ALERT, RED_ALERT,
                                   "#6F42C1", "#0D6EFD", "#20C997", "#E83E8C", "#FD7E14"],
