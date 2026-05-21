@@ -26,6 +26,7 @@ GENIE_URL = os.getenv(
     "GENIE_URL",
     "https://fevm-classic-stable-q1odfo.cloud.databricks.com/genie/rooms/01f1497305f91728a36e24163f0d10be?o=7474644801528071",
 )
+GENIE_SPACE_ID = os.getenv("GENIE_SPACE_ID", "01f1497305f91728a36e24163f0d10be")
 
 LAKEBASE_PROJECT = "code-yellow"
 LAKEBASE_ENDPOINT = f"projects/{LAKEBASE_PROJECT}/branches/production/endpoints/primary"
@@ -451,6 +452,97 @@ def get_dependency_blast_radius():
     return nodes, edges
 
 
+# ── GENIE CONVERSATION API ──────────────────────────────────────────────────
+def _genie_extract(message):
+    """Pull text + any query results out of a Genie response message."""
+    out = {"text": "", "sql": None, "rows": None, "columns": None, "row_count": 0}
+    try:
+        text_parts = []
+        sql_text = None
+        for att in (getattr(message, "attachments", None) or []):
+            txt = getattr(att, "text", None)
+            if txt is not None:
+                content = getattr(txt, "content", None) or ""
+                if content:
+                    text_parts.append(content)
+            q = getattr(att, "query", None)
+            if q is not None:
+                sql_text = getattr(q, "query", None) or getattr(q, "statement", None)
+                desc = getattr(q, "description", None) or ""
+                if desc:
+                    text_parts.append(desc)
+        if not text_parts:
+            top_text = getattr(message, "content", None)
+            if top_text:
+                text_parts.append(top_text)
+        out["text"] = "\n\n".join(t for t in text_parts if t).strip() or "(no answer)"
+        out["sql"] = sql_text
+    except Exception as e:
+        out["text"] = f"(could not parse Genie reply: {e})"
+    return out
+
+
+def _genie_query_result(w, conv_id, msg_id):
+    """Try to fetch the first query attachment's result rows, if any."""
+    try:
+        msg = w.genie.get_message(GENIE_SPACE_ID, conv_id, msg_id)
+        for att in (getattr(msg, "attachments", None) or []):
+            att_id = getattr(att, "attachment_id", None)
+            if att_id and getattr(att, "query", None):
+                res = w.genie.get_message_attachment_query_result(
+                    GENIE_SPACE_ID, conv_id, msg_id, att_id
+                )
+                sr = getattr(res, "statement_response", None) or res
+                manifest = getattr(sr, "manifest", None)
+                result   = getattr(sr, "result", None)
+                cols = []
+                if manifest:
+                    schema = getattr(manifest, "schema", None)
+                    if schema:
+                        cols = [getattr(c, "name", "") for c in (getattr(schema, "columns", None) or [])]
+                rows = getattr(result, "data_array", None) or []
+                return cols, rows
+    except Exception as e:
+        print(f"genie query-result fetch failed: {e}")
+    return [], []
+
+
+def genie_run_turn(user_text, conversation_id=None):
+    """Send a user message to the Genie space. Returns
+       {conversation_id, message_id, text, sql, columns, rows}."""
+    from databricks.sdk import WorkspaceClient
+    w = WorkspaceClient()
+    if conversation_id:
+        resp = w.genie.create_message_and_wait(
+            space_id=GENIE_SPACE_ID,
+            conversation_id=conversation_id,
+            content=user_text,
+        )
+        msg = resp
+    else:
+        resp = w.genie.start_conversation_and_wait(
+            space_id=GENIE_SPACE_ID,
+            content=user_text,
+        )
+        msg = getattr(resp, "message", resp)
+        conversation_id = getattr(resp, "conversation_id", None) or getattr(msg, "conversation_id", None)
+
+    parsed = _genie_extract(msg)
+    msg_id = getattr(msg, "message_id", None) or getattr(msg, "id", None)
+    cols, rows = ([], [])
+    if msg_id and conversation_id:
+        cols, rows = _genie_query_result(w, conversation_id, msg_id)
+    return {
+        "conversation_id": conversation_id,
+        "message_id": msg_id,
+        "text": parsed["text"],
+        "sql": parsed["sql"],
+        "columns": cols,
+        "rows": rows[:50],   # keep payload small
+        "row_count": len(rows),
+    }
+
+
 def get_assignment_groups():
     sql = "SELECT sys_id, name FROM service_now.synced_sys_user_group WHERE active = true ORDER BY name"
     return query_db(sql)
@@ -789,6 +881,80 @@ html, body {{
 .genie-iframe {{
   flex: 1 1 auto; width: 100%; border: 0; background: var(--bg-panel);
 }}
+.genie-chat__messages {{
+  flex: 1 1 auto; overflow-y: auto;
+  padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;
+  background: var(--bg-panel);
+}}
+.genie-msg {{
+  max-width: 92%; padding: 8px 12px; border-radius: 10px;
+  font-size: 0.84rem; line-height: 1.4;
+  white-space: pre-wrap; word-break: break-word;
+}}
+.genie-msg--user {{
+  align-self: flex-end;
+  background: rgba(124,92,255,0.20); color: var(--text-primary);
+  border: 1px solid rgba(124,92,255,0.40);
+}}
+.genie-msg--assistant {{
+  align-self: flex-start;
+  background: var(--bg-tile); color: var(--text-primary);
+  border: 1px solid var(--border-bright);
+}}
+.genie-msg--system {{
+  align-self: center; background: transparent;
+  color: var(--text-muted); font-size: 0.74rem; font-style: italic;
+  border: 0; padding: 2px 6px;
+}}
+.genie-msg__sql {{
+  margin-top: 6px; background: rgba(11,18,41,0.7);
+  border: 1px solid var(--border-subtle); border-radius: 6px;
+  padding: 6px 8px; color: var(--c-teal);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem; white-space: pre-wrap; max-height: 140px; overflow: auto;
+}}
+.genie-msg__table {{
+  margin-top: 6px; max-height: 180px; overflow: auto;
+  border: 1px solid var(--border-subtle); border-radius: 6px;
+}}
+.genie-msg__table table {{
+  width: 100%; border-collapse: collapse; font-size: 0.72rem;
+}}
+.genie-msg__table th, .genie-msg__table td {{
+  padding: 4px 8px; border-bottom: 1px solid var(--border-subtle);
+  text-align: left; color: var(--text-secondary);
+}}
+.genie-msg__table th {{
+  position: sticky; top: 0; background: var(--bg-tile);
+  color: var(--text-primary); font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.04em; font-size: 0.66rem;
+}}
+.genie-chat__input {{
+  border-top: 1px solid var(--border-subtle);
+  padding: 10px; display: flex; gap: 6px; background: var(--bg-panel);
+}}
+.genie-chat__input textarea {{
+  flex: 1; resize: none; background: var(--bg-tile);
+  color: var(--text-primary); border: 1px solid var(--border-bright);
+  border-radius: 6px; padding: 6px 8px; font-size: 0.84rem;
+  font-family: inherit; min-height: 38px; max-height: 110px;
+}}
+.genie-chat__input button {{
+  background: var(--c-purple); color: white; border: 0;
+  border-radius: 6px; padding: 6px 14px; font-weight: 700;
+  cursor: pointer; font-family: inherit; font-size: 0.84rem;
+}}
+.genie-chat__input button:disabled {{ opacity: 0.6; cursor: not-allowed; }}
+.genie-chips {{
+  display: flex; flex-wrap: wrap; gap: 4px;
+  padding: 4px 10px 10px; border-bottom: 1px solid var(--border-subtle);
+}}
+.genie-chip {{
+  border: 1px solid var(--border-bright); background: var(--bg-tile);
+  color: var(--text-secondary); padding: 3px 8px; border-radius: 999px;
+  font-size: 0.7rem; cursor: pointer; font-family: inherit;
+}}
+.genie-chip:hover {{ border-color: var(--c-purple); color: var(--text-primary); }}
 @media (max-width: 1280px) {{
   .page-layout {{ grid-template-columns: 1fr; }}
   .page-side {{ position: static; height: 620px; }}
@@ -1422,28 +1588,62 @@ app.layout = html.Div([
         ]),
         ], className="page-main"),
 
-        # ── RIGHT: Genie space (1/3) ───────────────────────────────
+        # ── RIGHT: Genie chat panel (1/3) ──────────────────────────
+        # Databricks sets X-Frame-Options: DENY on /genie/rooms/*, so we can't
+        # iframe it. Instead, this panel talks to the same Genie space via the
+        # Conversation API (the app SP needs CAN USE on the space).
+        dcc.Store(id="genie-conversation-id", data=None),
+        dcc.Store(id="genie-messages", data=[
+            {"role": "system",
+             "text": "Ask in plain English — I'll query the live ServiceNow + CMDB data."},
+        ]),
         html.Div([
             html.Div([
                 html.Div([
                     html.Div([
-                        html.I(className="fas fa-comments me-2",
-                               style={"color": PURPLE}),
+                        html.I(className="fas fa-comments me-2", style={"color": PURPLE}),
                         html.Span("Ask Genie", className="genie-panel__title"),
-                        html.Div("Natural-language Q&A over the live data",
+                        html.Div("Live Q&A over ServiceNow + CMDB data",
                                  className="genie-panel__sub"),
                     ]),
                     html.A([html.I(className="fas fa-arrow-up-right-from-square me-1"),
-                            "Open"],
+                            "Open in Databricks"],
                            href=GENIE_URL, target="_blank",
                            className="genie-panel__open"),
                 ], className="genie-panel__header"),
-                html.Iframe(
-                    src=GENIE_URL,
-                    className="genie-iframe",
-                    sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox",
-                    allow="clipboard-read; clipboard-write",
-                ),
+
+                # Suggested questions
+                html.Div([
+                    html.Button("Top apps by active incidents",
+                                id={"type": "genie-suggest",
+                                    "q": "Which CIs have the most active incidents right now? Top 10."},
+                                n_clicks=0, className="genie-chip"),
+                    html.Button("Life-safety today",
+                                id={"type": "genie-suggest",
+                                    "q": "List active incidents flagged as patient-safety impact."},
+                                n_clicks=0, className="genie-chip"),
+                    html.Button("MTTR by unit (30d)",
+                                id={"type": "genie-suggest",
+                                    "q": "Average MTTR in hours grouped by hospital unit over the last 30 days."},
+                                n_clicks=0, className="genie-chip"),
+                    html.Button("Pages last 24h",
+                                id={"type": "genie-suggest",
+                                    "q": "How many pages were sent in the last 24 hours and to which groups?"},
+                                n_clicks=0, className="genie-chip"),
+                ], className="genie-chips"),
+
+                # Messages
+                html.Div(id="genie-messages-container", className="genie-chat__messages"),
+
+                # Input
+                html.Div([
+                    dcc.Textarea(
+                        id="genie-input",
+                        placeholder="Ask Genie a question…  (Cmd/Ctrl+Enter to send)",
+                        n_clicks=0,
+                    ),
+                    html.Button("Send", id="genie-send", n_clicks=0),
+                ], className="genie-chat__input"),
             ], className="genie-panel"),
         ], className="page-side"),
 
@@ -2013,6 +2213,96 @@ def render_blast(_n, anchor, categories, risk_mode):
                 e["classes"] = "faded"
 
     return nodes_vis + edges_vis
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GENIE CHAT — callbacks
+# ─────────────────────────────────────────────────────────────────────────────
+def _render_genie_message(m):
+    role = m.get("role", "assistant")
+    cls = f"genie-msg genie-msg--{role}"
+    children = [m.get("text", "")]
+    if m.get("sql"):
+        children.append(html.Div(m["sql"], className="genie-msg__sql"))
+    cols = m.get("columns") or []
+    rows = m.get("rows") or []
+    if cols and rows:
+        table = html.Table([
+            html.Thead(html.Tr([html.Th(c) for c in cols])),
+            html.Tbody([html.Tr([html.Td(str(c) if c is not None else "") for c in r])
+                         for r in rows[:25]]),
+        ])
+        more = html.Div(f"Showing 25 of {m.get('row_count', len(rows))}",
+                        style={"fontSize": "0.68rem", "color": TEXT_MUTED, "padding": "4px 8px"}) \
+            if m.get("row_count", len(rows)) > 25 else None
+        children.append(html.Div([table, more], className="genie-msg__table"))
+    return html.Div(children, className=cls)
+
+
+@callback(
+    Output("genie-messages-container", "children"),
+    Input("genie-messages", "data"),
+)
+def render_genie_messages(messages):
+    return [_render_genie_message(m) for m in (messages or [])]
+
+
+@callback(
+    [Output("genie-messages", "data"),
+     Output("genie-conversation-id", "data"),
+     Output("genie-input", "value")],
+    [Input("genie-send", "n_clicks"),
+     Input("genie-input", "n_submit"),
+     Input({"type": "genie-suggest", "q": ALL}, "n_clicks")],
+    [State("genie-input", "value"),
+     State("genie-messages", "data"),
+     State("genie-conversation-id", "data")],
+    prevent_initial_call=True,
+)
+def genie_send_turn(_send, _submit, _suggest_clicks, text, messages, conv_id):
+    import json as _json
+    if not ctx.triggered:
+        return no_update, no_update, no_update
+
+    # Resolve user text: either the typed input or a clicked suggestion
+    user_text = (text or "").strip()
+    trig = ctx.triggered[0]["prop_id"]
+    if "genie-suggest" in trig:
+        real = next((t for t in ctx.triggered if t.get("value")), None)
+        if not real:
+            return no_update, no_update, no_update
+        try:
+            cid = _json.loads(real["prop_id"].rsplit(".", 1)[0])
+            user_text = cid.get("q") or ""
+        except Exception:
+            return no_update, no_update, no_update
+    if not user_text:
+        return no_update, no_update, no_update
+
+    msgs = list(messages or [])
+    msgs.append({"role": "user", "text": user_text})
+    msgs.append({"role": "system", "text": "Genie is thinking…"})
+
+    try:
+        result = genie_run_turn(user_text, conversation_id=conv_id)
+        # Replace the "thinking" placeholder with the real reply
+        msgs.pop()
+        msgs.append({
+            "role": "assistant",
+            "text": result.get("text") or "(empty response)",
+            "sql": result.get("sql"),
+            "columns": result.get("columns") or [],
+            "rows": result.get("rows") or [],
+            "row_count": result.get("row_count", 0),
+        })
+        new_conv_id = result.get("conversation_id") or conv_id
+    except Exception as e:
+        msgs.pop()
+        msgs.append({"role": "assistant",
+                     "text": f"Genie error: {str(e)[:300]}"})
+        new_conv_id = conv_id
+
+    return msgs, new_conv_id, ""
 
 
 @callback(
