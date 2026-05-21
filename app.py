@@ -1,4 +1,9 @@
 import os
+import smtplib
+import ssl
+import urllib.parse
+from email.message import EmailMessage
+
 import psycopg2
 import psycopg2.extras
 import pandas as pd
@@ -17,6 +22,14 @@ import plotly.graph_objects as go
 LAKEBASE_PROJECT = "code-yellow"
 LAKEBASE_ENDPOINT = f"projects/{LAKEBASE_PROJECT}/branches/production/endpoints/primary"
 LAKEBASE_DB = "databricks_postgres"
+
+# Email / paging configuration
+PAGE_EMAIL_TO = os.getenv("PAGE_EMAIL_TO", "sahil.merali@databricks.com")
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "code-yellow@databricks.com")
 
 # Akron Children's Hospital brand palette
 PURPLE = "#5C2D91"
@@ -218,6 +231,84 @@ def get_mttr_by_unit():
 def get_assignment_groups():
     sql = "SELECT sys_id, name FROM service_now.synced_sys_user_group WHERE active = true ORDER BY name"
     return query_db(sql)
+
+
+PAGE_TYPE_LABELS = {
+    "page_team":     "Page Team",
+    "bridge_call":   "Bridge Call",
+    "status_update": "Status Update",
+}
+
+
+def build_page_email(incident, form):
+    """Construct (subject, body, mailto_url) for an incident page email.
+
+    incident: dict from incidents-store (has number, short_description,
+              clinical_impact_tier, affected_unit, and we resolve more via DB)
+    form: {'page_type', 'group', 'unit', 'message', 'priority', 'description'}
+    """
+    inc_number   = incident.get("number") or "[INC number]"
+    priority     = form.get("priority")
+    priority_str = f"P{priority}" if priority not in (None, "", "?") else "[P1 / P2 / P3]"
+    group        = form.get("group") or "[team/group being paged]"
+    unit_id      = form.get("unit")
+    unit_label   = UNIT_NAME_BY_ID.get(unit_id, unit_id) if unit_id else "[system, application, or service impacted]"
+    message      = form.get("message") or "[free text description of the issue, impact, and any immediate actions needed]"
+    action_label = PAGE_TYPE_LABELS.get(form.get("page_type"), "Page Team")
+
+    body_lines = [
+        "**INCIDENT PAGE**",
+        "",
+        f"Incident: {inc_number}",
+        f"Page Type: {priority_str}",
+        f"Target Group: {group}",
+        f"Affected Unit: {unit_label}",
+        "",
+        "Message:",
+        message,
+        "",
+        "—",
+        f"Page action: {action_label}",
+        f"Sent by Code Yellow at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+    ]
+    body = "\n".join(body_lines)
+    subject = f"[{priority_str}] INCIDENT PAGE — {inc_number} — {action_label}"
+
+    mailto = (
+        f"mailto:{PAGE_EMAIL_TO}"
+        f"?subject={urllib.parse.quote(subject)}"
+        f"&body={urllib.parse.quote(body)}"
+    )
+    return subject, body, mailto
+
+
+def send_page_email(subject, body):
+    """Attempt to send email via SMTP. Returns (sent: bool, detail: str)."""
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        return False, "SMTP not configured — using mailto fallback."
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = PAGE_EMAIL_TO
+    msg.set_content(body)
+
+    try:
+        ctx_ssl = ssl.create_default_context()
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx_ssl, timeout=15) as s:
+                s.login(SMTP_USER, SMTP_PASSWORD)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+                s.ehlo()
+                s.starttls(context=ctx_ssl)
+                s.ehlo()
+                s.login(SMTP_USER, SMTP_PASSWORD)
+                s.send_message(msg)
+        return True, f"Email sent to {PAGE_EMAIL_TO}."
+    except Exception as e:
+        return False, f"SMTP error: {str(e)[:120]}"
 
 
 def get_recent_pages():
@@ -880,6 +971,8 @@ def refresh_data(_n, selected_unit):
         "short_description": i.get("short_description", ""),
         "clinical_impact_tier": i["clinical_impact_tier"],
         "affected_unit": i.get("affected_unit"),
+        "priority": i.get("priority"),
+        "location_name": i.get("location_name"),
     } for i in incidents]
 
     try:
@@ -1050,13 +1143,19 @@ def toggle_modal(_open, _close, _submit, _is_open):
 )
 def submit_page_action(_n_clicks, incident_id, page_type, group, unit, message, incidents_data):
     if not incident_id or not page_type or not group:
-        return dbc.Alert("Please fill required fields.", color="warning", className="mb-0 py-1")
-    inc_number, clinical_tier = "", ""
-    for inc in (incidents_data or []):
-        if inc["sys_id"] == incident_id:
-            inc_number = inc["number"]
-            clinical_tier = inc.get("clinical_impact_tier", "")
-            break
+        return dbc.Alert("Please select an incident, page type, and target group.",
+                         color="warning", className="mb-0 py-1")
+
+    incident = next((i for i in (incidents_data or []) if i["sys_id"] == incident_id), None)
+    if not incident:
+        return dbc.Alert("Couldn't resolve the selected incident — refresh and retry.",
+                         color="warning", className="mb-0 py-1")
+
+    inc_number    = incident.get("number", "")
+    clinical_tier = incident.get("clinical_impact_tier", "")
+
+    # 1) Log the page action to the DB (existing behavior)
+    db_msg = None
     try:
         execute_db(
             """INSERT INTO public.paged_actions
@@ -1065,9 +1164,57 @@ def submit_page_action(_n_clicks, incident_id, page_type, group, unit, message, 
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
             (incident_id, inc_number, group, "app_user", page_type, clinical_tier, unit, message),
         )
-        return dbc.Alert(f"Page sent to {group} for {inc_number}!", color="success", className="mb-0 py-1")
     except Exception as e:
-        return dbc.Alert(f"Error: {str(e)[:100]}", color="danger", className="mb-0 py-1")
+        db_msg = f"DB log error: {str(e)[:100]}"
+
+    # 2) Build templated email per user spec
+    form = {
+        "page_type":   page_type,
+        "group":       group,
+        "unit":        unit,
+        "message":     message,
+        "priority":    incident.get("priority"),
+        "description": incident.get("short_description", ""),
+    }
+    subject, body, mailto_url = build_page_email(incident, form)
+
+    # 3) Try real SMTP send; fall back to mailto link
+    sent, detail = send_page_email(subject, body)
+
+    parts = []
+    if sent:
+        parts.append(html.Div(
+            [html.I(className="fas fa-check-circle me-2"),
+             html.Strong("Email sent"), f" to {PAGE_EMAIL_TO}. Page also logged for {inc_number}."],
+            style={"color": "#0F5132"}))
+    else:
+        parts.append(html.Div(
+            [html.I(className="fas fa-envelope me-2"),
+             html.Strong("Open in your mail client"),
+             f" to send to {PAGE_EMAIL_TO}. ({detail}) Page logged for {inc_number}."],
+            style={"color": TEXT_PRIMARY}))
+        parts.append(html.Div(
+            html.A([html.I(className="fas fa-paper-plane me-1"),
+                    f"Send page email to {PAGE_EMAIL_TO}"],
+                   href=mailto_url, target="_blank",
+                   className="btn btn-sm",
+                   style={"background": PURPLE, "color": "white", "marginTop": "6px",
+                          "fontWeight": "700"}),
+        ))
+    if db_msg:
+        parts.append(html.Div(db_msg, style={"color": ORANGE_ALERT, "fontSize": "0.78rem", "marginTop": "4px"}))
+
+    # 4) Show the rendered email body so the user can review/copy
+    parts.append(html.Details([
+        html.Summary("Preview email body", style={"cursor": "pointer", "color": PURPLE,
+                                                   "fontSize": "0.8rem", "marginTop": "6px"}),
+        html.Pre(body, style={"background": "#F4F6F8", "border": f"1px solid {BORDER_SUBTLE}",
+                              "borderRadius": "6px", "padding": "10px", "fontSize": "0.78rem",
+                              "whiteSpace": "pre-wrap", "marginTop": "6px"}),
+    ]))
+
+    color = "success" if sent else "info"
+    return dbc.Alert(parts, color=color, className="mb-0 py-2", style={"width": "100%"})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
