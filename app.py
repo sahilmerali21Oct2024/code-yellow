@@ -22,11 +22,22 @@ cyto.load_extra_layouts()
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
+GENIE_SPACE_ID = os.getenv("GENIE_SPACE_ID", "01f1497305f91728a36e24163f0d10be")
+GENIE_WORKSPACE = os.getenv(
+    "GENIE_WORKSPACE",
+    "https://fevm-classic-stable-q1odfo.cloud.databricks.com",
+)
+# Databricks publishes /embed/genie/<space-id> for iframe embedding (it sends
+# a permissive Content-Security-Policy: frame-ancestors header). The regular
+# /genie/rooms/<id> URL is X-Frame-Options: DENY and cannot be iframed.
+GENIE_EMBED_URL = os.getenv(
+    "GENIE_EMBED_URL",
+    f"{GENIE_WORKSPACE}/embed/genie/{GENIE_SPACE_ID}",
+)
 GENIE_URL = os.getenv(
     "GENIE_URL",
-    "https://fevm-classic-stable-q1odfo.cloud.databricks.com/genie/rooms/01f1497305f91728a36e24163f0d10be?o=7474644801528071",
+    f"{GENIE_WORKSPACE}/genie/rooms/{GENIE_SPACE_ID}?o=7474644801528071",
 )
-GENIE_SPACE_ID = os.getenv("GENIE_SPACE_ID", "01f1497305f91728a36e24163f0d10be")
 
 LAKEBASE_PROJECT = "code-yellow"
 LAKEBASE_ENDPOINT = f"projects/{LAKEBASE_PROJECT}/branches/production/endpoints/primary"
@@ -1588,22 +1599,16 @@ app.layout = html.Div([
         ]),
         ], className="page-main"),
 
-        # ── RIGHT: Genie chat panel (1/3) ──────────────────────────
-        # Databricks sets X-Frame-Options: DENY on /genie/rooms/*, so we can't
-        # iframe it. Instead, this panel talks to the same Genie space via the
-        # Conversation API (the app SP needs CAN USE on the space).
-        dcc.Store(id="genie-conversation-id", data=None),
-        dcc.Store(id="genie-messages", data=[
-            {"role": "system",
-             "text": "Ask in plain English — I'll query the live ServiceNow + CMDB data."},
-        ]),
+        # ── RIGHT: Genie space — embedded via /embed/genie/<id> ────
+        # The standard /genie/rooms/* URL is X-Frame-Options: DENY; the
+        # /embed/genie/<space_id> path is the supported embed surface.
         html.Div([
             html.Div([
                 html.Div([
                     html.Div([
                         html.I(className="fas fa-comments me-2", style={"color": PURPLE}),
                         html.Span("Ask Genie", className="genie-panel__title"),
-                        html.Div("Live Q&A over ServiceNow + CMDB data",
+                        html.Div("Natural-language Q&A over the live data",
                                  className="genie-panel__sub"),
                     ]),
                     html.A([html.I(className="fas fa-arrow-up-right-from-square me-1"),
@@ -1611,39 +1616,11 @@ app.layout = html.Div([
                            href=GENIE_URL, target="_blank",
                            className="genie-panel__open"),
                 ], className="genie-panel__header"),
-
-                # Suggested questions
-                html.Div([
-                    html.Button("Top apps by active incidents",
-                                id={"type": "genie-suggest",
-                                    "q": "Which CIs have the most active incidents right now? Top 10."},
-                                n_clicks=0, className="genie-chip"),
-                    html.Button("Life-safety today",
-                                id={"type": "genie-suggest",
-                                    "q": "List active incidents flagged as patient-safety impact."},
-                                n_clicks=0, className="genie-chip"),
-                    html.Button("MTTR by unit (30d)",
-                                id={"type": "genie-suggest",
-                                    "q": "Average MTTR in hours grouped by hospital unit over the last 30 days."},
-                                n_clicks=0, className="genie-chip"),
-                    html.Button("Pages last 24h",
-                                id={"type": "genie-suggest",
-                                    "q": "How many pages were sent in the last 24 hours and to which groups?"},
-                                n_clicks=0, className="genie-chip"),
-                ], className="genie-chips"),
-
-                # Messages
-                html.Div(id="genie-messages-container", className="genie-chat__messages"),
-
-                # Input
-                html.Div([
-                    dcc.Textarea(
-                        id="genie-input",
-                        placeholder="Ask Genie a question…  (Cmd/Ctrl+Enter to send)",
-                        n_clicks=0,
-                    ),
-                    html.Button("Send", id="genie-send", n_clicks=0),
-                ], className="genie-chat__input"),
+                html.Iframe(
+                    src=GENIE_EMBED_URL,
+                    className="genie-iframe",
+                    allow="clipboard-read; clipboard-write",
+                ),
             ], className="genie-panel"),
         ], className="page-side"),
 
@@ -2213,96 +2190,6 @@ def render_blast(_n, anchor, categories, risk_mode):
                 e["classes"] = "faded"
 
     return nodes_vis + edges_vis
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GENIE CHAT — callbacks
-# ─────────────────────────────────────────────────────────────────────────────
-def _render_genie_message(m):
-    role = m.get("role", "assistant")
-    cls = f"genie-msg genie-msg--{role}"
-    children = [m.get("text", "")]
-    if m.get("sql"):
-        children.append(html.Div(m["sql"], className="genie-msg__sql"))
-    cols = m.get("columns") or []
-    rows = m.get("rows") or []
-    if cols and rows:
-        table = html.Table([
-            html.Thead(html.Tr([html.Th(c) for c in cols])),
-            html.Tbody([html.Tr([html.Td(str(c) if c is not None else "") for c in r])
-                         for r in rows[:25]]),
-        ])
-        more = html.Div(f"Showing 25 of {m.get('row_count', len(rows))}",
-                        style={"fontSize": "0.68rem", "color": TEXT_MUTED, "padding": "4px 8px"}) \
-            if m.get("row_count", len(rows)) > 25 else None
-        children.append(html.Div([table, more], className="genie-msg__table"))
-    return html.Div(children, className=cls)
-
-
-@callback(
-    Output("genie-messages-container", "children"),
-    Input("genie-messages", "data"),
-)
-def render_genie_messages(messages):
-    return [_render_genie_message(m) for m in (messages or [])]
-
-
-@callback(
-    [Output("genie-messages", "data"),
-     Output("genie-conversation-id", "data"),
-     Output("genie-input", "value")],
-    [Input("genie-send", "n_clicks"),
-     Input("genie-input", "n_submit"),
-     Input({"type": "genie-suggest", "q": ALL}, "n_clicks")],
-    [State("genie-input", "value"),
-     State("genie-messages", "data"),
-     State("genie-conversation-id", "data")],
-    prevent_initial_call=True,
-)
-def genie_send_turn(_send, _submit, _suggest_clicks, text, messages, conv_id):
-    import json as _json
-    if not ctx.triggered:
-        return no_update, no_update, no_update
-
-    # Resolve user text: either the typed input or a clicked suggestion
-    user_text = (text or "").strip()
-    trig = ctx.triggered[0]["prop_id"]
-    if "genie-suggest" in trig:
-        real = next((t for t in ctx.triggered if t.get("value")), None)
-        if not real:
-            return no_update, no_update, no_update
-        try:
-            cid = _json.loads(real["prop_id"].rsplit(".", 1)[0])
-            user_text = cid.get("q") or ""
-        except Exception:
-            return no_update, no_update, no_update
-    if not user_text:
-        return no_update, no_update, no_update
-
-    msgs = list(messages or [])
-    msgs.append({"role": "user", "text": user_text})
-    msgs.append({"role": "system", "text": "Genie is thinking…"})
-
-    try:
-        result = genie_run_turn(user_text, conversation_id=conv_id)
-        # Replace the "thinking" placeholder with the real reply
-        msgs.pop()
-        msgs.append({
-            "role": "assistant",
-            "text": result.get("text") or "(empty response)",
-            "sql": result.get("sql"),
-            "columns": result.get("columns") or [],
-            "rows": result.get("rows") or [],
-            "row_count": result.get("row_count", 0),
-        })
-        new_conv_id = result.get("conversation_id") or conv_id
-    except Exception as e:
-        msgs.pop()
-        msgs.append({"role": "assistant",
-                     "text": f"Genie error: {str(e)[:300]}"})
-        new_conv_id = conv_id
-
-    return msgs, new_conv_id, ""
 
 
 @callback(

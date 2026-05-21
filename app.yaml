@@ -12,6 +12,10 @@ env:
     value: "sahil.merali@databricks.com"
   - name: PAGE_SECRET_SCOPE
     value: "code-yellow"
-  # URL of the Genie space embedded in the right-side panel of the dashboard.
-  - name: GENIE_URL
-    value: "https://fevm-classic-stable-q1odfo.cloud.databricks.com/genie/rooms/01f1497305f91728a36e24163f0d10be?o=7474644801528071"
+  # Genie space embedded in the right-side panel.  We use the /embed/genie/
+  # iframe surface (browser-friendly frame-ancestors); the "Open in Databricks"
+  # link in the panel header still points at the full /genie/rooms/<id> UI.
+  - name: GENIE_SPACE_ID
+    value: "01f1497305f91728a36e24163f0d10be"
+  - name: GENIE_WORKSPACE
+    value: "https://fevm-classic-stable-q1odfo.cloud.databricks.com"
