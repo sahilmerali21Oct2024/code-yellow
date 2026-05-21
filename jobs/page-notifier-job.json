@@ -1,0 +1,41 @@
+{
+  "name": "code-yellow-page-notifier",
+  "description": "Sends a templated INCIDENT PAGE email when triggered by the Code Yellow app. Transport: Resend > SMTP > log-only.",
+  "tasks": [
+    {
+      "task_key": "send_page_email",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Users/sahil.merali@databricks.com/apps/code-yellow/notebooks/send_page_email",
+        "source": "WORKSPACE"
+      },
+      "environment_key": "Default",
+      "timeout_seconds": 600
+    }
+  ],
+  "parameters": [
+    {"name": "inc_number",   "default": ""},
+    {"name": "priority",     "default": ""},
+    {"name": "group",        "default": ""},
+    {"name": "unit",         "default": ""},
+    {"name": "unit_label",   "default": ""},
+    {"name": "page_type",    "default": "page_team"},
+    {"name": "message",      "default": ""},
+    {"name": "page_to",      "default": "sahil.merali@databricks.com"},
+    {"name": "secret_scope", "default": "code-yellow"}
+  ],
+  "email_notifications": {
+    "on_failure": ["sahil.merali@databricks.com"],
+    "no_alert_for_skipped_runs": true
+  },
+  "max_concurrent_runs": 10,
+  "performance_target": "PERFORMANCE_OPTIMIZED",
+  "queue": {"enabled": true},
+  "environments": [
+    {
+      "environment_key": "Default",
+      "spec": {
+        "client": "3"
+      }
+    }
+  ]
+}

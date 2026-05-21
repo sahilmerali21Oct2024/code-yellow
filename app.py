@@ -31,21 +31,37 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER or "code-yellow@databricks.com")
 
-# Akron Children's Hospital brand palette
-PURPLE = "#5C2D91"
-PURPLE_DARK = "#421F69"
-PURPLE_LIGHT = "#EDE6F5"
-GREEN = "#7AB648"
-TEAL = "#00A8A8"
-TEAL_DARK = "#007A7A"
-BG_PAGE = "#F4F6F8"
-BG_CARD = "#FFFFFF"
-TEXT_PRIMARY = "#1F2937"
-TEXT_MUTED = "#6B7280"
-BORDER_SUBTLE = "#E5E7EB"
-RED_ALERT = "#DC3545"
-ORANGE_ALERT = "#FD7E14"
-GRAY_INACTIVE = "#ADB5BD"
+# Databricks Job that sends the page email (Option 1 architecture)
+PAGE_NOTIFIER_JOB_ID = os.getenv("PAGE_NOTIFIER_JOB_ID", "")
+PAGE_SECRET_SCOPE = os.getenv("PAGE_SECRET_SCOPE", "code-yellow")
+
+# Code Yellow - Dark Command Center palette (inspired by major-incident dashboards)
+PURPLE = "#8B5CF6"        # brighter purple for dark bg
+PURPLE_DARK = "#6D28D9"
+PURPLE_LIGHT = "#312249"
+TEAL = "#14B8A6"
+TEAL_DARK = "#0E8F84"
+GREEN = "#22C55E"
+BLUE = "#3B82F6"
+AMBER = "#F59E0B"
+RED_ALERT = "#EF4444"
+ORANGE_ALERT = "#F97316"
+GRAY_INACTIVE = "#3F4F6E"
+
+# Surfaces
+BG_PAGE = "#0A1428"       # deep navy page background
+BG_HEADER = "#0F1B33"
+BG_PANEL = "#13213C"      # panel surface
+BG_PANEL_HEAD = "#172847"
+BG_TILE = "#1A2B4A"
+BORDER_SUBTLE = "#23365E"
+BORDER_BRIGHT = "#2E4978"
+
+# Text
+TEXT_PRIMARY = "#E6EEFB"
+TEXT_SECONDARY = "#B7C3D6"
+TEXT_MUTED = "#7C8DA8"
+BG_CARD = BG_PANEL
 
 HOSPITAL_UNITS = [
     {"id": "nicu", "name": "NICU"},
@@ -283,9 +299,10 @@ def build_page_email(incident, form):
 
 
 def send_page_email(subject, body):
-    """Attempt to send email via SMTP. Returns (sent: bool, detail: str)."""
+    """In-process SMTP send. Used only as a fallback when the Job route is
+    unavailable. Returns (sent: bool, detail: str)."""
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
-        return False, "SMTP not configured — using mailto fallback."
+        return False, "Local SMTP not configured."
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -309,6 +326,32 @@ def send_page_email(subject, body):
         return True, f"Email sent to {PAGE_EMAIL_TO}."
     except Exception as e:
         return False, f"SMTP error: {str(e)[:120]}"
+
+
+def trigger_page_notifier_job(incident, form):
+    """Fire the Databricks Job that sends the email. Returns (run_id, detail)."""
+    if not PAGE_NOTIFIER_JOB_ID:
+        return None, "PAGE_NOTIFIER_JOB_ID not configured on the app."
+    try:
+        from databricks.sdk import WorkspaceClient
+        w = WorkspaceClient()
+        unit_id = form.get("unit") or ""
+        unit_label = UNIT_NAME_BY_ID.get(unit_id, unit_id) if unit_id else ""
+        params = {
+            "inc_number":   str(incident.get("number") or ""),
+            "priority":     str(incident.get("priority") or ""),
+            "group":        str(form.get("group") or ""),
+            "unit":         str(unit_id),
+            "unit_label":   str(unit_label),
+            "page_type":    str(form.get("page_type") or "page_team"),
+            "message":      str(form.get("message") or ""),
+            "page_to":      PAGE_EMAIL_TO,
+            "secret_scope": PAGE_SECRET_SCOPE,
+        }
+        run = w.jobs.run_now(job_id=int(PAGE_NOTIFIER_JOB_ID), job_parameters=params)
+        return run.run_id, f"Job triggered (run_id={run.run_id})."
+    except Exception as e:
+        return None, f"Job trigger error: {str(e)[:200]}"
 
 
 def get_recent_pages():
@@ -366,6 +409,8 @@ def build_floor_map(incidents, selected_unit):
         is_selected = selected_unit == uid
 
         tile_class = "floor-tile"
+        if info:
+            tile_class += " floor-tile--has-incidents"
         if is_pulse:
             tile_class += " floor-tile--pulse"
         if is_selected:
@@ -419,16 +464,23 @@ app = dash.Dash(
 
 CUSTOM_CSS = f"""
 :root {{
-  --ach-purple: {PURPLE};
-  --ach-purple-dark: {PURPLE_DARK};
-  --ach-purple-light: {PURPLE_LIGHT};
-  --ach-teal: {TEAL};
-  --ach-green: {GREEN};
+  --c-purple: {PURPLE};
+  --c-purple-dark: {PURPLE_DARK};
+  --c-purple-light: {PURPLE_LIGHT};
+  --c-teal: {TEAL};
+  --c-green: {GREEN};
+  --c-blue: {BLUE};
+  --c-amber: {AMBER};
   --bg-page: {BG_PAGE};
-  --bg-card: {BG_CARD};
+  --bg-header: {BG_HEADER};
+  --bg-panel: {BG_PANEL};
+  --bg-panel-head: {BG_PANEL_HEAD};
+  --bg-tile: {BG_TILE};
   --text-primary: {TEXT_PRIMARY};
+  --text-secondary: {TEXT_SECONDARY};
   --text-muted: {TEXT_MUTED};
   --border-subtle: {BORDER_SUBTLE};
+  --border-bright: {BORDER_BRIGHT};
 }}
 
 * {{ box-sizing: border-box; }}
@@ -442,119 +494,124 @@ html, body {{
 
 /* ── HEADER ───────────────────────────────────────────── */
 .app-header {{
-  background: var(--bg-card);
-  border-bottom: 4px solid var(--ach-purple);
-  padding: 18px 28px;
+  background: linear-gradient(180deg, {BG_HEADER} 0%, {BG_PAGE} 100%);
+  border-bottom: 1px solid var(--border-subtle);
+  padding: 14px 24px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
 }}
 .app-header__brand {{ display: flex; align-items: center; gap: 14px; }}
-.app-header__logo {{
-  width: 44px; height: 44px; border-radius: 10px;
-  background: linear-gradient(135deg, var(--ach-purple) 0%, var(--ach-teal) 100%);
+.app-header__numbox {{
+  width: 38px; height: 38px; border-radius: 8px;
+  background: var(--c-purple);
   display: inline-flex; align-items: center; justify-content: center;
-  color: white; font-size: 1.3rem;
+  color: white; font-size: 1.15rem; font-weight: 900;
+  box-shadow: 0 0 0 1px rgba(139,92,246,0.4);
 }}
 .app-header__title {{
-  font-size: 1.35rem; font-weight: 900;
-  letter-spacing: 0.02em; color: var(--ach-purple); line-height: 1.1;
+  font-size: 1.15rem; font-weight: 700;
+  letter-spacing: 0.01em; color: var(--text-primary); line-height: 1.1;
 }}
 .app-header__subtitle {{
-  font-size: 0.85rem; font-weight: 400; color: var(--text-muted); margin-top: 2px;
+  font-size: 0.78rem; font-weight: 400; color: var(--text-muted); margin-top: 3px;
 }}
 .app-header__meta {{ display: flex; align-items: center; gap: 16px; }}
-.app-header__time {{ font-size: 0.85rem; color: var(--text-muted); }}
+.app-header__time {{
+  font-size: 0.78rem; color: var(--text-muted);
+  padding: 4px 10px; border: 1px solid var(--border-subtle);
+  border-radius: 6px; background: var(--bg-panel);
+}}
 
 /* ── LEGEND ───────────────────────────────────────────── */
 .legend-bar {{
-  background: var(--bg-card);
-  padding: 10px 28px;
+  background: var(--bg-header);
+  padding: 8px 24px;
   border-bottom: 1px solid var(--border-subtle);
   display: flex; flex-wrap: wrap; gap: 18px; align-items: center;
-  font-size: 0.82rem; color: var(--text-muted);
+  font-size: 0.78rem; color: var(--text-secondary);
 }}
 .legend-item {{ display: inline-flex; align-items: center; gap: 6px; }}
-.legend-dot {{
-  width: 12px; height: 12px; border-radius: 3px; display: inline-block;
-}}
+.legend-dot {{ width: 10px; height: 10px; border-radius: 50%; display: inline-block; }}
 
 /* ── CARDS ────────────────────────────────────────────── */
-.page-body {{ padding: 24px 28px; }}
+.page-body {{ padding: 18px 24px; background: var(--bg-page); }}
 .panel {{
-  background: var(--bg-card);
+  background: var(--bg-panel);
   border: 1px solid var(--border-subtle);
-  border-radius: 10px;
-  box-shadow: 0 1px 2px rgba(16,24,40,0.04), 0 1px 3px rgba(16,24,40,0.05);
+  border-radius: 8px;
   overflow: hidden;
   height: 100%;
+  box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 4px 16px rgba(0,0,0,0.25);
 }}
 .panel__header {{
-  padding: 14px 18px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--border-subtle);
   display: flex; align-items: center; justify-content: space-between;
-  background: linear-gradient(180deg, #FAFAFC 0%, #FFFFFF 100%);
+  background: var(--bg-panel-head);
 }}
 .panel__title {{
-  font-size: 0.95rem; font-weight: 700; color: var(--ach-purple);
-  margin: 0; letter-spacing: 0.01em;
+  font-size: 0.82rem; font-weight: 700; color: var(--text-primary);
+  margin: 0; letter-spacing: 0.06em; text-transform: uppercase;
 }}
-.panel__body {{ padding: 16px 18px; }}
+.panel__body {{ padding: 14px 16px; }}
 
 /* ── FLOOR MAP TILES ─────────────────────────────────── */
 .floor-grid {{
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 12px;
-  padding: 4px;
+  gap: 10px;
+  padding: 2px;
 }}
 .floor-tile {{
   position: relative;
   font-family: inherit;
-  border: 2px solid var(--border-subtle);
-  border-radius: 10px;
-  padding: 14px 12px;
-  min-height: 90px;
+  border: 1px solid var(--border-bright);
+  border-radius: 8px;
+  padding: 14px 10px;
+  min-height: 84px;
   display: flex; flex-direction: column; justify-content: center;
   text-align: center;
   cursor: pointer;
-  transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease;
+  background: var(--bg-tile);
+  color: var(--text-primary);
+  transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease, border-color 120ms ease;
   outline: none;
 }}
 .floor-tile:hover {{
-  transform: translateY(-2px);
-  box-shadow: 0 6px 14px rgba(92,45,145,0.18);
-  filter: brightness(1.05);
-}}
-.floor-tile:focus-visible {{ box-shadow: 0 0 0 3px rgba(92,45,145,0.35); }}
-.floor-tile--selected {{
-  box-shadow: 0 0 0 3px var(--ach-purple), 0 6px 14px rgba(92,45,145,0.25);
   transform: translateY(-1px);
+  border-color: var(--c-purple);
+  box-shadow: 0 6px 14px rgba(139,92,246,0.25);
+}}
+.floor-tile:focus-visible {{ box-shadow: 0 0 0 2px rgba(139,92,246,0.55); }}
+.floor-tile--selected {{
+  box-shadow: 0 0 0 2px var(--c-purple), 0 6px 14px rgba(139,92,246,0.30);
 }}
 .floor-tile__name {{
-  font-size: 1.05rem; font-weight: 900; letter-spacing: 0.03em;
+  font-size: 0.98rem; font-weight: 800; letter-spacing: 0.04em;
 }}
 .floor-tile__meta {{
-  font-size: 0.72rem; font-weight: 400; opacity: 0.9; margin-top: 4px;
+  font-size: 0.7rem; font-weight: 400; opacity: 0.85; margin-top: 4px;
+  color: var(--text-secondary);
 }}
+.floor-tile--has-incidents .floor-tile__meta {{ color: rgba(255,255,255,0.95); }}
 .floor-tile__badge {{
   position: absolute; top: 6px; right: 8px;
-  font-size: 0.72rem; font-weight: 900;
+  font-size: 0.7rem; font-weight: 900;
   padding: 2px 7px; border-radius: 999px;
-  box-shadow: 0 1px 2px rgba(0,0,0,0.15);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.4);
 }}
 @keyframes pulseTile {{
-  0%, 100% {{ box-shadow: 0 0 0 0 rgba(220,53,69,0.55); }}
-  50%      {{ box-shadow: 0 0 0 10px rgba(220,53,69,0); }}
+  0%, 100% {{ box-shadow: 0 0 0 0 rgba(239,68,68,0.55); }}
+  50%      {{ box-shadow: 0 0 0 10px rgba(239,68,68,0); }}
 }}
 .floor-tile--pulse {{ animation: pulseTile 1.6s ease-in-out infinite; }}
 
 /* ── BADGES ──────────────────────────────────────────── */
 .tier-pill {{
   display: inline-block;
-  padding: 2px 9px; border-radius: 999px;
-  font-size: 0.7rem; font-weight: 700; letter-spacing: 0.04em;
+  padding: 2px 8px; border-radius: 4px;
+  font-size: 0.68rem; font-weight: 800; letter-spacing: 0.05em;
   text-transform: uppercase; color: white;
 }}
 .tier-pill--life-safety   {{ background: {RED_ALERT}; }}
@@ -562,98 +619,100 @@ html, body {{
 .tier-pill--administrative {{ background: {GREEN}; }}
 
 .count-pill {{
-  background: var(--ach-purple); color: white;
-  padding: 4px 12px; border-radius: 999px;
-  font-size: 0.8rem; font-weight: 700;
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--c-purple); color: white;
+  padding: 5px 12px; border-radius: 6px;
+  font-size: 0.78rem; font-weight: 800; letter-spacing: 0.04em;
+  text-transform: uppercase;
 }}
 .count-pill--alert {{ background: {RED_ALERT}; }}
 .count-pill--warn  {{ background: {ORANGE_ALERT}; }}
-.count-pill--ok    {{ background: var(--ach-green); }}
+.count-pill--ok    {{ background: var(--c-green); }}
 
 /* ── FILTER BANNER ───────────────────────────────────── */
 .filter-banner {{
   display: flex; align-items: center; justify-content: space-between;
-  background: var(--ach-purple-light);
-  border: 1px solid #D8C7EE;
-  color: var(--ach-purple-dark);
-  padding: 8px 12px; border-radius: 8px;
+  background: var(--c-purple-light);
+  border: 1px solid var(--c-purple);
+  color: var(--text-primary);
+  padding: 8px 12px; border-radius: 6px;
   margin: 0 0 12px 0;
-  font-size: 0.85rem;
+  font-size: 0.82rem;
 }}
 .filter-banner__clear {{
-  background: transparent; border: 1px solid var(--ach-purple);
-  color: var(--ach-purple); font-weight: 700; font-size: 0.78rem;
-  padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  background: transparent; border: 1px solid var(--c-purple);
+  color: var(--text-primary); font-weight: 700; font-size: 0.74rem;
+  padding: 4px 10px; border-radius: 5px; cursor: pointer;
 }}
-.filter-banner__clear:hover {{ background: var(--ach-purple); color: white; }}
+.filter-banner__clear:hover {{ background: var(--c-purple); color: white; }}
 
 /* ── INCIDENT CARDS (expandable) ─────────────────────── */
 .inc-list {{ display: flex; flex-direction: column; gap: 6px; }}
 .inc-card {{
   border: 1px solid var(--border-subtle);
-  border-radius: 8px;
-  background: var(--bg-card);
+  border-radius: 6px;
+  background: var(--bg-tile);
   transition: box-shadow 120ms ease, border-color 120ms ease;
   overflow: hidden;
 }}
 .inc-card:hover {{
-  border-color: #D8C7EE;
-  box-shadow: 0 2px 6px rgba(92,45,145,0.08);
+  border-color: var(--c-purple);
 }}
 .inc-card[open] {{
-  border-color: var(--ach-purple);
-  box-shadow: 0 4px 14px rgba(92,45,145,0.10);
+  border-color: var(--c-purple);
+  box-shadow: 0 4px 14px rgba(139,92,246,0.18);
 }}
 .inc-card__summary {{
   list-style: none;
   cursor: pointer;
-  padding: 10px 12px;
+  padding: 9px 12px;
   display: grid;
-  grid-template-columns: 18px 110px 110px 1fr 40px 70px;
+  grid-template-columns: 18px 100px 110px 1fr 40px 70px;
   align-items: center;
   gap: 10px;
-  font-size: 0.85rem;
+  font-size: 0.82rem;
   user-select: none;
+  color: var(--text-primary);
 }}
 .inc-card__summary::-webkit-details-marker {{ display: none; }}
 .inc-card__chevron {{
   display: inline-block;
-  color: var(--ach-purple);
+  color: var(--c-purple);
   font-size: 0.9rem;
   transition: transform 150ms ease;
 }}
 .inc-card[open] .inc-card__chevron {{ transform: rotate(90deg); }}
-.inc-card__num  {{ font-weight: 700; color: var(--ach-purple); }}
+.inc-card__num  {{ font-weight: 800; color: var(--c-teal); }}
 .inc-card__pill {{ justify-self: start; }}
 .inc-card__desc {{
   color: var(--text-primary);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }}
-.inc-card__pri  {{ font-weight: 700; color: var(--text-muted); text-align: center; }}
-.inc-card__time {{ color: var(--text-muted); font-size: 0.8rem; text-align: right; }}
+.inc-card__pri  {{ font-weight: 800; color: var(--c-amber); text-align: center; }}
+.inc-card__time {{ color: var(--text-muted); font-size: 0.78rem; text-align: right; }}
 
 .inc-detail__grid {{
   border-top: 1px dashed var(--border-subtle);
-  background: #FAFBFD;
+  background: rgba(0,0,0,0.18);
   padding: 12px 14px;
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   column-gap: 18px;
-  row-gap: 6px;
-  font-size: 0.82rem;
+  row-gap: 4px;
+  font-size: 0.8rem;
 }}
 .inc-detail__row {{
   display: grid;
   grid-template-columns: 150px 1fr;
   gap: 8px;
   padding: 3px 0;
-  border-bottom: 1px solid #EEF0F3;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
   align-items: start;
 }}
 .inc-detail__label {{
   color: var(--text-muted);
-  font-size: 0.72rem;
-  letter-spacing: 0.04em;
+  font-size: 0.7rem;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
   font-weight: 700;
   padding-top: 1px;
@@ -671,27 +730,43 @@ html, body {{
 }}
 
 .empty-state {{
-  text-align: center; padding: 36px 12px; color: var(--text-muted); font-size: 0.9rem;
+  text-align: center; padding: 36px 12px; color: var(--text-muted); font-size: 0.88rem;
 }}
 
 /* ── BUTTONS ─────────────────────────────────────────── */
 .btn-primary-ach {{
-  background: var(--ach-purple); border-color: var(--ach-purple);
-  font-weight: 700;
+  background: var(--c-purple); border-color: var(--c-purple);
+  font-weight: 700; color: white;
 }}
-.btn-primary-ach:hover {{ background: var(--ach-purple-dark); border-color: var(--ach-purple-dark); }}
+.btn-primary-ach:hover {{ background: var(--c-purple-dark); border-color: var(--c-purple-dark); }}
 
 /* ── PAGES FEED ──────────────────────────────────────── */
 .page-feed__item {{
-  padding: 10px 0; border-bottom: 1px solid #F1F3F5;
+  padding: 10px 0; border-bottom: 1px solid var(--border-subtle);
 }}
 .page-feed__item:last-child {{ border-bottom: none; }}
-.page-feed__title {{ font-weight: 700; color: var(--text-primary); font-size: 0.88rem; }}
-.page-feed__meta  {{ color: var(--text-muted); font-size: 0.78rem; margin-top: 2px; }}
+.page-feed__title {{ font-weight: 800; color: var(--c-teal); font-size: 0.86rem; }}
+.page-feed__meta  {{ color: var(--text-muted); font-size: 0.76rem; margin-top: 2px; }}
+
+/* ── MODAL OVERRIDES (dark theme) ────────────────────── */
+.modal-content {{ background: var(--bg-panel); color: var(--text-primary); border: 1px solid var(--border-subtle); }}
+.modal-header, .modal-footer {{ border-color: var(--border-subtle); }}
+.modal-title {{ color: var(--text-primary); }}
+.form-label {{ color: var(--text-secondary); font-weight: 700; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }}
+.form-control, .form-select, .Select-control, textarea.form-control {{
+  background: var(--bg-tile) !important; color: var(--text-primary) !important;
+  border-color: var(--border-bright) !important;
+}}
+.form-control::placeholder, textarea.form-control::placeholder {{ color: var(--text-muted); }}
+.Select-menu-outer, .VirtualizedSelectFocusedOption {{ background: var(--bg-panel) !important; color: var(--text-primary) !important; }}
+.btn-close {{ filter: invert(1) opacity(0.7); }}
+
+/* Plotly chart dark tweaks */
+.js-plotly-plot .plotly .modebar {{ display: none !important; }}
 
 @media (max-width: 900px) {{
   .floor-grid {{ grid-template-columns: repeat(2, 1fr); }}
-  .page-body {{ padding: 16px; }}
+  .page-body {{ padding: 14px; }}
 }}
 """
 
@@ -709,10 +784,12 @@ def header():
     return html.Div(
         [
             html.Div([
-                html.Div(html.I(className="fas fa-heart-pulse"), className="app-header__logo"),
+                html.Div("1", className="app-header__numbox"),
                 html.Div([
-                    html.Div("CODE YELLOW", className="app-header__title"),
-                    html.Div("Clinical Impact Command Center", className="app-header__subtitle"),
+                    html.Div("Code Yellow — Clinical Impact Command Center",
+                             className="app-header__title"),
+                    html.Div("Real-time coordination for critical healthcare incidents",
+                             className="app-header__subtitle"),
                 ]),
             ], className="app-header__brand"),
             html.Div([
@@ -1036,11 +1113,20 @@ def update_selected_unit(_tile_clicks, _clear_clicks, current):
     return no_update
 
 
+DARK_PLOT_LAYOUT = dict(
+    plot_bgcolor=BG_PANEL,
+    paper_bgcolor=BG_PANEL,
+    font=dict(family="Lato, system-ui, sans-serif", color=TEXT_SECONDARY),
+    xaxis=dict(gridcolor=BORDER_SUBTLE, zerolinecolor=BORDER_SUBTLE, color=TEXT_MUTED),
+    yaxis=dict(gridcolor=BORDER_SUBTLE, zerolinecolor=BORDER_SUBTLE, color=TEXT_MUTED),
+)
+
+
 def _empty_mttr_fig(message):
     fig = go.Figure()
     fig.update_layout(
         height=280, margin=dict(l=40, r=20, t=12, b=40),
-        plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+        **DARK_PLOT_LAYOUT,
         annotations=[{"text": message, "xref": "paper", "yref": "paper",
                       "x": 0.5, "y": 0.5, "showarrow": False,
                       "font": {"color": TEXT_MUTED, "family": "Lato, sans-serif", "size": 13}}],
@@ -1082,17 +1168,14 @@ def update_mttr_chart(_n, selected_unit):
         labels={"resolve_date": "Date",
                 "mttr_hours": "Mean Time To Resolve (hours)",
                 "location_name": "Location"},
-        template="plotly_white",
         color_discrete_sequence=[PURPLE, TEAL, GREEN, ORANGE_ALERT, RED_ALERT,
-                                  "#6F42C1", "#0D6EFD", "#20C997", "#E83E8C", "#FD7E14"],
+                                  BLUE, AMBER, "#EC4899", "#06B6D4", "#A78BFA"],
     )
     fig.update_layout(
-        margin=dict(l=40, r=20, t=12, b=40), height=280,
-        legend=dict(orientation="h", yanchor="bottom", y=-0.3, x=0.5, xanchor="center",
-                    font=dict(size=10)),
-        font=dict(family="Lato, system-ui, sans-serif"),
-        plot_bgcolor="#FFFFFF",
-        paper_bgcolor="#FFFFFF",
+        margin=dict(l=40, r=20, t=12, b=50), height=280,
+        legend=dict(orientation="h", yanchor="bottom", y=-0.35, x=0.5, xanchor="center",
+                    font=dict(size=10, color=TEXT_SECONDARY)),
+        **DARK_PLOT_LAYOUT,
     )
     fig.update_traces(line=dict(width=2.5), mode="lines+markers", marker=dict(size=5))
     return fig, title
@@ -1178,21 +1261,35 @@ def submit_page_action(_n_clicks, incident_id, page_type, group, unit, message, 
     }
     subject, body, mailto_url = build_page_email(incident, form)
 
-    # 3) Try real SMTP send; fall back to mailto link
-    sent, detail = send_page_email(subject, body)
+    # 3) Trigger the Databricks Job that sends email (Option 1). Fall back to
+    #    in-process SMTP, then to a mailto: link the user can click.
+    run_id, job_detail = trigger_page_notifier_job(incident, form)
+    job_route = run_id is not None
+    sent = False
+    detail = job_detail
+    if not job_route:
+        sent, detail = send_page_email(subject, body)
 
     parts = []
-    if sent:
+    if job_route:
+        parts.append(html.Div(
+            [html.I(className="fas fa-cogs me-2"),
+             html.Strong("Email dispatched via Databricks Job"),
+             f" — run_id {run_id}. Logged for {inc_number} → {PAGE_EMAIL_TO}."],
+            style={"color": GREEN}))
+    elif sent:
         parts.append(html.Div(
             [html.I(className="fas fa-check-circle me-2"),
-             html.Strong("Email sent"), f" to {PAGE_EMAIL_TO}. Page also logged for {inc_number}."],
-            style={"color": "#0F5132"}))
+             html.Strong("Email sent (SMTP)"),
+             f" to {PAGE_EMAIL_TO}. Page also logged for {inc_number}."],
+            style={"color": GREEN}))
     else:
         parts.append(html.Div(
             [html.I(className="fas fa-envelope me-2"),
              html.Strong("Open in your mail client"),
-             f" to send to {PAGE_EMAIL_TO}. ({detail}) Page logged for {inc_number}."],
+             f" to send to {PAGE_EMAIL_TO}.  Page logged for {inc_number}."],
             style={"color": TEXT_PRIMARY}))
+        parts.append(html.Div(detail, style={"color": TEXT_MUTED, "fontSize": "0.76rem", "marginTop": "2px"}))
         parts.append(html.Div(
             html.A([html.I(className="fas fa-paper-plane me-1"),
                     f"Send page email to {PAGE_EMAIL_TO}"],
@@ -1213,7 +1310,7 @@ def submit_page_action(_n_clicks, incident_id, page_type, group, unit, message, 
                               "whiteSpace": "pre-wrap", "marginTop": "6px"}),
     ]))
 
-    color = "success" if sent else "info"
+    color = "success" if (job_route or sent) else "info"
     return dbc.Alert(parts, color=color, className="mb-0 py-2", style={"width": "100%"})
 
 

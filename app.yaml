@@ -1,3 +1,14 @@
 command:
   - "python"
   - "app.py"
+env:
+  # ID of the Databricks Job 'code-yellow-page-notifier' that sends the
+  # incident-page email. When set, clicking 'Send Page' in the UI fires this
+  # job (Option 1 architecture). Falls back to in-process SMTP / mailto if
+  # unset.
+  - name: PAGE_NOTIFIER_JOB_ID
+    value: "96755215589266"
+  - name: PAGE_EMAIL_TO
+    value: "sahil.merali@databricks.com"
+  - name: PAGE_SECRET_SCOPE
+    value: "code-yellow"
