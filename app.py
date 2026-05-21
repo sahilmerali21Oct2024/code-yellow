@@ -32,7 +32,7 @@ GENIE_WORKSPACE = os.getenv(
 # /genie/rooms/<id> URL is X-Frame-Options: DENY and cannot be iframed.
 GENIE_EMBED_URL = os.getenv(
     "GENIE_EMBED_URL",
-    f"{GENIE_WORKSPACE}/embed/genie/{GENIE_SPACE_ID}",
+    f"{GENIE_WORKSPACE}/embed/genie/rooms/{GENIE_SPACE_ID}?o=7474644801528071",
 )
 GENIE_URL = os.getenv(
     "GENIE_URL",
@@ -1619,7 +1619,7 @@ app.layout = html.Div([
                 html.Iframe(
                     src=GENIE_EMBED_URL,
                     className="genie-iframe",
-                    allow="clipboard-read; clipboard-write",
+                    allow="clipboard-write",
                 ),
             ], className="genie-panel"),
         ], className="page-side"),
