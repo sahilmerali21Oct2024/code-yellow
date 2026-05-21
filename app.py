@@ -792,7 +792,30 @@ html, body {{
   border-color: var(--border-bright) !important;
 }}
 .form-control::placeholder, textarea.form-control::placeholder {{ color: var(--text-muted); }}
-.Select-menu-outer, .VirtualizedSelectFocusedOption {{ background: var(--bg-panel) !important; color: var(--text-primary) !important; }}
+/* react-select (dcc.Dropdown) — force light text on dark tile so values are readable */
+.Select-control, .Select-control .Select-value, .Select-control .Select-value-label,
+.Select-control .Select-input > input, .Select-control .Select-input input,
+.Select--single > .Select-control .Select-value, .Select-placeholder,
+.has-value.Select--single > .Select-control .Select-value .Select-value-label,
+.has-value.is-pseudo-focused.Select--single > .Select-control .Select-value .Select-value-label {{
+  color: var(--text-primary) !important;
+}}
+.Select-placeholder {{ color: var(--text-muted) !important; }}
+.Select-menu-outer {{
+  background: var(--bg-panel) !important; color: var(--text-primary) !important;
+  border: 1px solid var(--border-bright) !important;
+}}
+.Select-option {{ background: var(--bg-panel) !important; color: var(--text-primary) !important; }}
+.Select-option.is-focused, .VirtualizedSelectFocusedOption {{
+  background: rgba(124,92,255,0.18) !important; color: #FFFFFF !important;
+}}
+.Select-option.is-selected {{ background: rgba(124,92,255,0.32) !important; color: #FFFFFF !important; }}
+.Select-arrow {{ border-color: var(--text-secondary) transparent transparent !important; }}
+.Select-clear {{ color: var(--text-secondary) !important; }}
+.Select.is-focused:not(.is-open) > .Select-control {{
+  border-color: var(--c-purple) !important;
+  box-shadow: 0 0 0 2px rgba(124,92,255,0.25) !important;
+}}
 .btn-close {{ filter: invert(1) opacity(0.7); }}
 
 /* Plotly chart dark tweaks */
@@ -1329,15 +1352,13 @@ def submit_page_action(_n_clicks, incident_id, page_type, group, unit, message, 
     parts = []
     if job_route:
         parts.append(html.Div(
-            [html.I(className="fas fa-cogs me-2"),
-             html.Strong("Email dispatched via Databricks Job"),
-             f" — run_id {run_id}. Logged for {inc_number} → {PAGE_EMAIL_TO}."],
+            [html.I(className="fas fa-check-circle me-2"),
+             html.Strong("Page sent successfully")],
             style={"color": GREEN}))
     elif sent:
         parts.append(html.Div(
             [html.I(className="fas fa-check-circle me-2"),
-             html.Strong("Email sent (SMTP)"),
-             f" to {PAGE_EMAIL_TO}. Page also logged for {inc_number}."],
+             html.Strong("Page sent successfully")],
             style={"color": GREEN}))
     else:
         parts.append(html.Div(
