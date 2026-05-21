@@ -671,6 +671,23 @@ html, body {{
 
 /* ── INCIDENT CARDS (expandable) ─────────────────────── */
 .inc-list {{ display: flex; flex-direction: column; gap: 6px; }}
+.inc-list__header {{
+  display: grid;
+  grid-template-columns: 18px 100px 105px 1fr 76px 40px 64px;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 2px;
+}}
+.inc-list__header span:nth-child(5) {{ text-align: center; }}
+.inc-list__header span:nth-child(6) {{ text-align: center; }}
+.inc-list__header span:nth-child(7) {{ text-align: right; }}
 .inc-card {{
   border: 1px solid var(--border-subtle);
   border-radius: 6px;
@@ -1032,8 +1049,17 @@ def render_incident_card(inc):
 def render_incidents_list(incidents):
     if not incidents:
         return html.Div("No active incidents.", className="empty-state")
+    header = html.Div([
+        html.Span(""),            # chevron column
+        html.Span("Incident #"),
+        html.Span("Impact tier"),
+        html.Span("Description"),
+        html.Span("Unit"),
+        html.Span("Pri"),
+        html.Span("Open"),
+    ], className="inc-list__header")
     return html.Div(
-        [render_incident_card(i) for i in incidents],
+        [header] + [render_incident_card(i) for i in incidents],
         className="inc-list",
     )
 
