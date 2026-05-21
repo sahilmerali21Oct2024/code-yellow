@@ -667,12 +667,23 @@ html, body {{
   cursor: pointer;
   padding: 9px 12px;
   display: grid;
-  grid-template-columns: 18px 100px 110px 1fr 40px 70px;
+  grid-template-columns: 18px 100px 105px 1fr 76px 40px 64px;
   align-items: center;
   gap: 10px;
   font-size: 0.82rem;
   user-select: none;
   color: var(--text-primary);
+}}
+.inc-card__unit {{
+  font-weight: 700;
+  color: var(--c-teal);
+  text-align: center;
+  font-size: 0.74rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: rgba(20,184,166,0.12);
+  padding: 2px 6px;
+  border-radius: 4px;
 }}
 .inc-card__summary::-webkit-details-marker {{ display: none; }}
 .inc-card__chevron {{
@@ -726,7 +737,7 @@ html, body {{
 }}
 @media (max-width: 700px) {{
   .inc-card__summary {{ grid-template-columns: 18px 1fr 60px; gap: 6px; }}
-  .inc-card__pill, .inc-card__pri, .inc-card__time {{ display: none; }}
+  .inc-card__pill, .inc-card__unit, .inc-card__pri, .inc-card__time {{ display: none; }}
 }}
 
 .empty-state {{
@@ -780,6 +791,9 @@ app.index_string = (
 )
 
 
+HOSPITAL_NAME = "Akron Children's Hospital"
+
+
 def header():
     return html.Div(
         [
@@ -788,7 +802,7 @@ def header():
                 html.Div([
                     html.Div("Code Yellow — Clinical Impact Command Center",
                              className="app-header__title"),
-                    html.Div("Real-time coordination for critical healthcare incidents",
+                    html.Div(f"{HOSPITAL_NAME}  ·  Real-time coordination for critical incidents",
                              className="app-header__subtitle"),
                 ]),
             ], className="app-header__brand"),
@@ -854,7 +868,7 @@ app.layout = html.Div([
 
         dbc.Row([
             dbc.Col(html.Div([
-                html.Div(html.H6("Mean Time To Resolve (MTTR) — by Unit · Last 30 Days",
+                html.Div(html.H6("Mean Time To Resolve (MTTR) — by Floor Unit · Last 30 Days",
                                  id="mttr-title", className="panel__title"),
                          className="panel__header"),
                 html.Div(dcc.Graph(id="mttr-chart", config={"displayModeBar": False}), className="panel__body"),
@@ -930,6 +944,7 @@ def _fmt_dt(value, dash="\u2014"):
 
 def render_incident_card(inc):
     tier = inc["clinical_impact_tier"]
+    unit_name = UNIT_NAME_BY_ID.get(inc.get("affected_unit")) if inc.get("affected_unit") else "Other"
     detail_rows = [
         ("Incident #",          _fmt(inc.get("number"))),
         ("Short description",   _fmt(inc.get("short_description"))),
@@ -939,8 +954,7 @@ def render_incident_card(inc):
         ("Urgency",             _fmt(inc.get("urgency"))),
         ("Category",            _fmt(inc.get("category"))),
         ("Assignment group",    _fmt(inc.get("assignment_group"))),
-        ("Location",            _fmt(inc.get("location_name"))),
-        ("Mapped unit",         _fmt(UNIT_NAME_BY_ID.get(inc.get("affected_unit")) if inc.get("affected_unit") else None)),
+        ("Floor unit",          unit_name),
         ("CI name",             _fmt(inc.get("ci_name"))),
         ("Clinical CI",         _fmt(inc.get("is_clinical"))),
         ("Service tier",        _fmt(inc.get("service_tier"))),
@@ -948,6 +962,7 @@ def render_incident_card(inc):
         ("Clinical-impact tag", _fmt(inc.get("u_clinical_impact"))),
         ("Opened",              _fmt_dt(inc.get("opened_at"))),
         ("Time open",           _fmt(inc.get("time_open"))),
+        ("Raw location",        _fmt(inc.get("location_name"))),
         ("sys_id",              _fmt(inc.get("sys_id"))),
     ]
     details = html.Div(
@@ -961,6 +976,7 @@ def render_incident_card(inc):
         html.Span(inc.get("number") or "—", className="inc-card__num"),
         html.Span(tier.replace("-", " ").title(), className=f"tier-pill tier-pill--{tier} inc-card__pill"),
         html.Span((inc.get("short_description") or "")[:70], className="inc-card__desc"),
+        html.Span(unit_name, className="inc-card__unit"),
         html.Span(f"P{_fmt(inc.get('priority'))}", className="inc-card__pri"),
         html.Span(inc.get("time_open") or "—", className="inc-card__time"),
     ], className="inc-card__summary")
@@ -1141,7 +1157,7 @@ def _empty_mttr_fig(message):
      Input("selected-unit-store", "data")],
 )
 def update_mttr_chart(_n, selected_unit):
-    base_title = "Mean Time To Resolve (MTTR) — by Unit · Last 30 Days"
+    base_title = "Mean Time To Resolve (MTTR) — by Floor Unit · Last 30 Days"
     try:
         data = get_mttr_by_unit()
     except Exception as e:
@@ -1153,23 +1169,37 @@ def update_mttr_chart(_n, selected_unit):
 
     df = pd.DataFrame(data)
     df["unit_id"] = df["location_name"].apply(get_unit_from_location)
+    df["unit"] = df["unit_id"].map(lambda u: UNIT_NAME_BY_ID.get(u, "Other"))
+
+    # Re-aggregate to per-(unit, date) so we get one line per floor unit
+    # rather than per raw location_name.
+    agg = (
+        df.groupby(["unit", "resolve_date"], as_index=False)
+          .agg(mttr_hours=("mttr_hours", "mean"))
+    )
 
     title = base_title
     if selected_unit:
         unit_name = UNIT_NAME_BY_ID.get(selected_unit, selected_unit)
         title = f"Mean Time To Resolve (MTTR) — {unit_name} · Last 30 Days"
-        df = df[df["unit_id"] == selected_unit]
-        if df.empty:
+        agg = agg[agg["unit"] == unit_name]
+        if agg.empty:
             return _empty_mttr_fig(f"No resolved incidents for {unit_name} in the last 30 days"), title
 
-    color_col = "location_name"
+    # Stable color order matching floor-map tile order, so each unit gets the
+    # same color in the chart that it has on the map.
+    unit_order = [u["name"] for u in HOSPITAL_UNITS] + ["Other"]
+    unit_palette = [PURPLE, TEAL, GREEN, ORANGE_ALERT, RED_ALERT,
+                    BLUE, AMBER, "#EC4899", "#06B6D4", "#A78BFA", "#6B7280"]
+    color_map = {u: unit_palette[i % len(unit_palette)] for i, u in enumerate(unit_order)}
+
     fig = px.line(
-        df, x="resolve_date", y="mttr_hours", color=color_col,
+        agg, x="resolve_date", y="mttr_hours", color="unit",
         labels={"resolve_date": "Date",
                 "mttr_hours": "Mean Time To Resolve (hours)",
-                "location_name": "Location"},
-        color_discrete_sequence=[PURPLE, TEAL, GREEN, ORANGE_ALERT, RED_ALERT,
-                                  BLUE, AMBER, "#EC4899", "#06B6D4", "#A78BFA"],
+                "unit": "Unit"},
+        category_orders={"unit": unit_order},
+        color_discrete_map=color_map,
     )
     fig.update_layout(
         margin=dict(l=40, r=20, t=12, b=50), height=280,
