@@ -157,6 +157,19 @@ def execute_db(sql, params=None):
         conn.close()
 
 
+def execute_db_returning(sql, params=None):
+    """INSERT/UPDATE with RETURNING. Returns the first row as dict, or None."""
+    conn = get_lakebase_connection()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+        conn.commit()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLINICAL IMPACT CLASSIFIER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -328,8 +341,9 @@ def send_page_email(subject, body):
         return False, f"SMTP error: {str(e)[:120]}"
 
 
-def trigger_page_notifier_job(incident, form):
-    """Fire the Databricks Job that sends the email. Returns (run_id, detail)."""
+def trigger_page_notifier_job(incident, form, lakebase_row):
+    """Fire the Databricks Job that sends the email and syncs to UC.
+    Returns (run_id, detail)."""
     if not PAGE_NOTIFIER_JOB_ID:
         return None, "PAGE_NOTIFIER_JOB_ID not configured on the app."
     try:
@@ -337,16 +351,25 @@ def trigger_page_notifier_job(incident, form):
         w = WorkspaceClient()
         unit_id = form.get("unit") or ""
         unit_label = UNIT_NAME_BY_ID.get(unit_id, unit_id) if unit_id else ""
+        created_at = lakebase_row.get("created_at") if lakebase_row else None
+        created_at_iso = created_at.isoformat() if created_at else ""
         params = {
-            "inc_number":   str(incident.get("number") or ""),
-            "priority":     str(incident.get("priority") or ""),
-            "group":        str(form.get("group") or ""),
-            "unit":         str(unit_id),
-            "unit_label":   str(unit_label),
-            "page_type":    str(form.get("page_type") or "page_team"),
-            "message":      str(form.get("message") or ""),
-            "page_to":      PAGE_EMAIL_TO,
-            "secret_scope": PAGE_SECRET_SCOPE,
+            "inc_number":     str(incident.get("number") or ""),
+            "priority":       str(incident.get("priority") or ""),
+            "group":          str(form.get("group") or ""),
+            "unit":           str(unit_id),
+            "unit_label":     str(unit_label),
+            "page_type":      str(form.get("page_type") or "page_team"),
+            "message":        str(form.get("message") or ""),
+            "page_to":        PAGE_EMAIL_TO,
+            "secret_scope":   PAGE_SECRET_SCOPE,
+            # UC sync params (the same row we just inserted into Lakebase)
+            "action_id":      str(lakebase_row.get("action_id") or "") if lakebase_row else "",
+            "incident_sys_id": str(incident.get("sys_id") or ""),
+            "paged_by":       "app_user",
+            "clinical_impact_tier": str(incident.get("clinical_impact_tier") or ""),
+            "created_at_iso": created_at_iso,
+            "uc_target":      "sahil_merali.service_now.paged_actions",
         }
         run = w.jobs.run_now(job_id=int(PAGE_NOTIFIER_JOB_ID), job_parameters=params)
         return run.run_id, f"Job triggered (run_id={run.run_id})."
@@ -1267,14 +1290,17 @@ def submit_page_action(_n_clicks, incident_id, page_type, group, unit, message, 
     inc_number    = incident.get("number", "")
     clinical_tier = incident.get("clinical_impact_tier", "")
 
-    # 1) Log the page action to the DB (existing behavior)
+    # 1) Log the page action to Lakebase, capture the generated action_id +
+    #    created_at so we can MERGE the same row into UC from the Job.
     db_msg = None
+    lakebase_row = None
     try:
-        execute_db(
+        lakebase_row = execute_db_returning(
             """INSERT INTO public.paged_actions
                (incident_sys_id, incident_number, paged_group, paged_by,
                 page_type, clinical_impact_tier, affected_unit, message)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+               RETURNING action_id, created_at""",
             (incident_id, inc_number, group, "app_user", page_type, clinical_tier, unit, message),
         )
     except Exception as e:
@@ -1291,9 +1317,9 @@ def submit_page_action(_n_clicks, incident_id, page_type, group, unit, message, 
     }
     subject, body, mailto_url = build_page_email(incident, form)
 
-    # 3) Trigger the Databricks Job that sends email (Option 1). Fall back to
-    #    in-process SMTP, then to a mailto: link the user can click.
-    run_id, job_detail = trigger_page_notifier_job(incident, form)
+    # 3) Trigger the Databricks Job that sends email + syncs the row to UC
+    #    (Option 1). Fall back to in-process SMTP, then to a mailto: link.
+    run_id, job_detail = trigger_page_notifier_job(incident, form, lakebase_row)
     job_route = run_id is not None
     sent = False
     detail = job_detail

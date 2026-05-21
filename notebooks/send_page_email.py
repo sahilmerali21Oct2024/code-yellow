@@ -37,6 +37,13 @@ dbutils.widgets.text("page_type", "page_team", "Page action type")
 dbutils.widgets.text("message", "", "Free-text message")
 dbutils.widgets.text("page_to", "sahil.merali@databricks.com", "Email recipient")
 dbutils.widgets.text("secret_scope", "code-yellow", "Databricks secret scope")
+# UC sync params (mirror of the row inserted into Lakebase by the app)
+dbutils.widgets.text("action_id", "", "Lakebase action_id (UUID)")
+dbutils.widgets.text("incident_sys_id", "", "Incident sys_id")
+dbutils.widgets.text("paged_by", "app_user", "Paged by")
+dbutils.widgets.text("clinical_impact_tier", "", "Clinical impact tier")
+dbutils.widgets.text("created_at_iso", "", "Lakebase created_at (ISO 8601)")
+dbutils.widgets.text("uc_target", "sahil_merali.service_now.paged_actions", "UC table for sync")
 
 inc_number   = dbutils.widgets.get("inc_number") or "[INC number]"
 priority     = dbutils.widgets.get("priority") or ""
@@ -47,6 +54,12 @@ page_type    = dbutils.widgets.get("page_type") or "page_team"
 message_body = dbutils.widgets.get("message") or "[free text description of the issue, impact, and any immediate actions needed]"
 page_to      = dbutils.widgets.get("page_to") or "sahil.merali@databricks.com"
 secret_scope = dbutils.widgets.get("secret_scope") or "code-yellow"
+action_id        = dbutils.widgets.get("action_id") or ""
+incident_sys_id  = dbutils.widgets.get("incident_sys_id") or ""
+paged_by         = dbutils.widgets.get("paged_by") or "app_user"
+clinical_tier    = dbutils.widgets.get("clinical_impact_tier") or ""
+created_at_iso   = dbutils.widgets.get("created_at_iso") or ""
+uc_target        = dbutils.widgets.get("uc_target") or "sahil_merali.service_now.paged_actions"
 
 PAGE_TYPE_LABELS = {
     "page_team":     "Page Team",
@@ -190,6 +203,69 @@ else:
 print(f"\nTransport: {transport}")
 print("Result:", detail)
 
+# COMMAND ----------
+# MAGIC %md ## Sync the row to Unity Catalog (event-driven Lakebase → UC)
+# COMMAND ----------
+
+uc_status = None
+uc_detail = None
+if not action_id:
+    uc_status = "skipped"
+    uc_detail = "No action_id passed; nothing to sync."
+else:
+    try:
+        from pyspark.sql import Row
+        from pyspark.sql.functions import lit, to_timestamp, current_timestamp
+        from delta.tables import DeltaTable
+
+        # Build the row exactly as it exists in Lakebase. We only have the
+        # fields the app passed; everything else stays NULL in UC and can be
+        # backfilled later if needed (e.g. acknowledged_at via an update flow).
+        row_df = (
+            spark.createDataFrame(
+                [Row(
+                    action_id=action_id,
+                    incident_sys_id=incident_sys_id,
+                    incident_number=inc_number,
+                    paged_group=group,
+                    paged_by=paged_by,
+                    page_type=page_type,
+                    clinical_impact_tier=clinical_tier or None,
+                    affected_unit=unit_id or None,
+                    message=message_body or None,
+                )]
+            )
+            .withColumn("bridge_call_link", lit(None).cast("string"))
+            .withColumn("workaround_status", lit(None).cast("string"))
+            .withColumn("acknowledged_at", lit(None).cast("timestamp"))
+            .withColumn(
+                "created_at",
+                to_timestamp(lit(created_at_iso)) if created_at_iso else current_timestamp(),
+            )
+            .withColumn("updated_at", current_timestamp())
+        )
+
+        # MERGE-by-action_id for idempotency (job retries won't double-insert)
+        target = DeltaTable.forName(spark, uc_target)
+        (
+            target.alias("t")
+                  .merge(row_df.alias("s"), "t.action_id = s.action_id")
+                  .whenNotMatchedInsertAll()
+                  .whenMatchedUpdateAll()
+                  .execute()
+        )
+        uc_status = "merged"
+        uc_detail = f"Synced action_id={action_id} into {uc_target}"
+    except Exception as e:
+        uc_status = "error"
+        uc_detail = f"UC sync error: {str(e)[:300]}"
+
+print(f"\nUC sync: {uc_status} — {uc_detail}")
+
+# COMMAND ----------
+# MAGIC %md ## Exit
+# COMMAND ----------
+
 result = {
     "transport": transport,
     "sent": bool(sent),
@@ -197,6 +273,7 @@ result = {
     "to": page_to,
     "subject": subject,
     "inc_number": inc_number,
+    "uc_sync": {"status": uc_status, "detail": uc_detail, "target": uc_target, "action_id": action_id},
 }
 
 # Always exit success — the app shouldn't get a hard failure just because the
