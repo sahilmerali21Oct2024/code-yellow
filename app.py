@@ -13,8 +13,11 @@ from databricks.sdk.core import Config
 import dash
 from dash import dcc, html, callback, Input, Output, State, ALL, no_update, ctx
 import dash_bootstrap_components as dbc
+import dash_cytoscape as cyto
 import plotly.express as px
 import plotly.graph_objects as go
+
+cyto.load_extra_layouts()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -261,6 +264,186 @@ def get_mttr_by_unit():
     for r in rows:
         r["clinical_impact_tier"] = classify_clinical_impact(r)
     return rows
+
+
+# ── DEPENDENCY BLAST RADIUS ──────────────────────────────────────────────────
+# Healthcare topology rules — derive CI → CI edges from category/subcategory,
+# since the ServiceNow synced CMDB doesn't include cmdb_rel_ci. These rules
+# encode how a real hospital service map would look:
+#   foundation: AD, SSO, network, storage, virt, integration engine
+#   clinical apps depend on identity + integration + storage + network
+#   imaging depends on PACS + storage + integration
+#   pharmacy ADCs depend on Epic Willow + AD + integration
+#   medical devices depend on Epic + integration + network
+DEP_RULES = [
+    # (predicate on source row, predicate on target row, weight)
+    # Everything Epic depends on the SSO + integration engine + AD + storage.
+    (lambda c: c["name"].startswith("Epic"),
+     lambda c: c["name"] in ("Imprivata OneSign (SSO)", "Rhapsody Integration Engine",
+                              "Active Directory (Corp)", "Pure Storage FlashArray",
+                              "VMware vCenter (Prod)"), 0.9),
+    # PACS depends on storage, integration, SSO, network
+    (lambda c: c["subcategory"] == "Imaging",
+     lambda c: c["name"] in ("Sectra VNA", "Pure Storage FlashArray",
+                              "Rhapsody Integration Engine", "Imprivata OneSign (SSO)",
+                              "Core Network Switch - Riverside"), 0.85),
+    # LIS depends on Epic Beaker + integration
+    (lambda c: c["subcategory"] == "Laboratory" and "Sunquest" in c["name"],
+     lambda c: c["name"] in ("Epic Beaker Lab", "Rhapsody Integration Engine"), 0.8),
+    # Pharmacy ADC depends on Epic Willow + AD + integration
+    (lambda c: c["subcategory"] == "ADC",
+     lambda c: c["name"] in ("Epic Willow Inpatient", "Active Directory (Corp)",
+                              "Rhapsody Integration Engine"), 0.85),
+    # Medical devices depend on Epic + integration + network
+    (lambda c: c["category"] == "Medical Device",
+     lambda c: c["name"] in ("Epic ClinDoc", "Epic Hyperspace - Production",
+                              "Rhapsody Integration Engine",
+                              "Meraki Wireless (Hospital WiFi)"), 0.75),
+    # Voice / dictation depends on Epic + AD
+    (lambda c: c["subcategory"] == "Voice Recognition",
+     lambda c: c["name"] in ("Epic Hyperspace - Production", "Active Directory (Corp)"), 0.7),
+    # Communications (Vocera, IP phones) depend on AD + network
+    (lambda c: c["category"] == "Communications",
+     lambda c: c["name"] in ("Active Directory (Corp)",
+                              "Core Network Switch - Riverside",
+                              "Meraki Wireless (Hospital WiFi)"), 0.6),
+    # Collaboration depends on AD + Office 365 + network
+    (lambda c: c["category"] == "Collaboration",
+     lambda c: c["name"] in ("Active Directory (Corp)", "Office 365 (Exchange Online)",
+                              "Palo Alto Firewall (Perimeter)"), 0.55),
+    # HR / Productivity / Supply Chain / IT Tools depend on AD
+    (lambda c: c["category"] in ("HR", "Productivity", "Supply Chain", "IT Tools", "Revenue Cycle"),
+     lambda c: c["name"] == "Active Directory (Corp)", 0.6),
+    # MyChart / patient SSO chain
+    (lambda c: "MyChart" in c["name"],
+     lambda c: c["name"] in ("Okta (Patient & Partner SSO)", "F5 Load Balancers",
+                              "Palo Alto Firewall (Perimeter)"), 0.85),
+    # VPN/Remote Access feeds Identity
+    (lambda c: c["subcategory"] == "Remote Access",
+     lambda c: c["name"] in ("Active Directory (Corp)", "Palo Alto Firewall (Perimeter)"), 0.7),
+    # Network hierarchy
+    (lambda c: c["category"] == "Network" and c["subcategory"] in ("Wireless", "Switch", "Load Balancer"),
+     lambda c: c["name"] == "Palo Alto Firewall (Perimeter)", 0.65),
+    # Backup / monitoring depends on storage + virt
+    (lambda c: c["subcategory"] in ("Backup", "SIEM"),
+     lambda c: c["name"] in ("Pure Storage FlashArray", "VMware vCenter (Prod)"), 0.55),
+]
+
+
+# Coarser groupings shown as chip filters in the UI.
+DEP_CATEGORY_BUCKETS = {
+    "ehr":           ("EHR",          lambda r: r["subcategory"] == "EHR"),
+    "imaging":       ("Imaging",      lambda r: r["subcategory"] == "Imaging"),
+    "identity":      ("Identity",     lambda r: r["category"] == "Identity"),
+    "interfaces":    ("Interfaces",   lambda r: r["category"] == "Integration"),
+    "devices":       ("Devices",      lambda r: r["category"] == "Medical Device"),
+    "network":       ("Network",      lambda r: r["category"] == "Network"),
+    "infrastructure":("Infrastructure", lambda r: r["category"] == "Infrastructure"),
+    "pharmacy":      ("Pharmacy",     lambda r: r["category"] == "Pharmacy Automation"),
+    "comm":          ("Comms",        lambda r: r["category"] in ("Communications", "Collaboration")),
+    "business":      ("Business",     lambda r: r["category"] in ("HR", "Productivity", "Supply Chain",
+                                                                    "IT Tools", "Revenue Cycle", "Security")),
+}
+
+
+def _ci_bucket(row):
+    for bid, (_, pred) in DEP_CATEGORY_BUCKETS.items():
+        if pred(row):
+            return bid
+    return "business"
+
+
+def get_dependency_blast_radius():
+    """Build the CMDB blast-radius graph: nodes (each CI w/ incident pressure
+    + risk score) and edges (derived from healthcare topology rules)."""
+    ci_sql = """
+        SELECT c.sys_id, c.name, c.ci_class, c.category, c.subcategory,
+               c.business_criticality, c.service_tier, c.is_clinical,
+               c.support_group,
+               COALESCE(SUM(CASE WHEN i.active THEN 1 ELSE 0 END), 0)                AS incident_count,
+               COALESCE(SUM(CASE WHEN i.active AND i.priority = 1 THEN 1 ELSE 0 END), 0) AS p1_count,
+               COALESCE(SUM(CASE WHEN i.active AND i.priority IN (1,2) THEN 1 ELSE 0 END), 0) AS major_count,
+               COALESCE(SUM(CASE WHEN i.active AND i.u_patient_safety_impact THEN 1 ELSE 0 END), 0) AS patient_safety
+        FROM service_now.synced_cmdb_ci c
+        LEFT JOIN service_now.synced_incident i ON i.cmdb_ci = c.sys_id
+        GROUP BY c.sys_id, c.name, c.ci_class, c.category, c.subcategory,
+                 c.business_criticality, c.service_tier, c.is_clinical, c.support_group
+        ORDER BY c.name
+    """
+    rows = query_db(ci_sql)
+
+    def risk(r):
+        if r["patient_safety"] > 0: return 100
+        if r["p1_count"] > 0:       return 85
+        if r["incident_count"] >= 10: return 65
+        if r["incident_count"] > 0: return 35
+        return 5
+
+    def status(score):
+        if score >= 80: return "critical"
+        if score >= 35: return "warning"
+        return "healthy"
+
+    nodes = []
+    by_name = {r["name"]: r for r in rows}
+    for r in rows:
+        r["risk_score"] = risk(r)
+        r["status"] = status(r["risk_score"])
+        r["bucket"] = _ci_bucket(r)
+        crit_n = 1 if (r["business_criticality"] or "").startswith("1") else (
+            2 if (r["business_criticality"] or "").startswith("2") else 3
+        )
+        nodes.append({
+            "data": {
+                "id": r["sys_id"],
+                "name": r["name"],
+                "label": r["name"],
+                "category": r["category"] or "Other",
+                "subcategory": r["subcategory"] or "",
+                "bucket": r["bucket"],
+                "criticality": crit_n,
+                "service_tier": r["service_tier"] or "",
+                "is_clinical": bool(r["is_clinical"]),
+                "incident_count": int(r["incident_count"]),
+                "p1_count": int(r["p1_count"]),
+                "major_count": int(r["major_count"]),
+                "patient_safety": int(r["patient_safety"]),
+                "risk_score": int(r["risk_score"]),
+                "status": r["status"],
+                "has_p1": bool(r["p1_count"] > 0 or r["patient_safety"] > 0),
+            },
+            "classes": f"node-{r['status']} bucket-{r['bucket']}"
+                       + (" has-p1" if r["p1_count"] > 0 or r["patient_safety"] > 0 else ""),
+        })
+
+    edges = []
+    seen = set()
+    for src in rows:
+        for src_pred, tgt_pred, weight in DEP_RULES:
+            try:
+                if not src_pred(src): continue
+            except Exception: continue
+            for tgt in rows:
+                if tgt["sys_id"] == src["sys_id"]: continue
+                try:
+                    if not tgt_pred(tgt): continue
+                except Exception: continue
+                key = (src["sys_id"], tgt["sys_id"])
+                if key in seen: continue
+                seen.add(key)
+                shared = min(src["incident_count"], tgt["incident_count"])
+                edges.append({
+                    "data": {
+                        "id": f"{src['sys_id']}__{tgt['sys_id']}",
+                        "source": src["sys_id"],
+                        "target": tgt["sys_id"],
+                        "weight": weight,
+                        "shared_incidents": int(shared),
+                        "thickness": 1.0 + weight * 2.0 + min(shared, 6) * 0.4,
+                    },
+                })
+
+    return nodes, edges
 
 
 def get_assignment_groups():
@@ -588,17 +771,17 @@ html, body {{
 /* ── FLOOR MAP TILES ─────────────────────────────────── */
 .floor-grid {{
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 10px;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
   padding: 2px;
 }}
 .floor-tile {{
   position: relative;
   font-family: inherit;
   border: 1px solid var(--border-bright);
-  border-radius: 8px;
-  padding: 14px 10px;
-  min-height: 84px;
+  border-radius: 6px;
+  padding: 8px 6px;
+  min-height: 52px;
   display: flex; flex-direction: column; justify-content: center;
   text-align: center;
   cursor: pointer;
@@ -617,17 +800,17 @@ html, body {{
   box-shadow: 0 0 0 2px var(--c-purple), 0 6px 14px rgba(139,92,246,0.30);
 }}
 .floor-tile__name {{
-  font-size: 0.98rem; font-weight: 800; letter-spacing: 0.04em;
+  font-size: 0.78rem; font-weight: 800; letter-spacing: 0.04em;
 }}
 .floor-tile__meta {{
-  font-size: 0.7rem; font-weight: 400; opacity: 0.85; margin-top: 4px;
+  font-size: 0.62rem; font-weight: 400; opacity: 0.85; margin-top: 2px;
   color: var(--text-secondary);
 }}
 .floor-tile--has-incidents .floor-tile__meta {{ color: rgba(255,255,255,0.95); }}
 .floor-tile__badge {{
-  position: absolute; top: 6px; right: 8px;
-  font-size: 0.7rem; font-weight: 900;
-  padding: 2px 7px; border-radius: 999px;
+  position: absolute; top: 3px; right: 4px;
+  font-size: 0.6rem; font-weight: 900;
+  padding: 1px 5px; border-radius: 999px;
   box-shadow: 0 1px 2px rgba(0,0,0,0.4);
 }}
 @keyframes pulseTile {{
@@ -687,6 +870,72 @@ html, body {{
 .tier-chip--life-safety.tier-chip--active    {{ background: {RED_ALERT}; }}
 .tier-chip--care-delivery.tier-chip--active  {{ background: {ORANGE_ALERT}; }}
 .tier-chip--administrative.tier-chip--active {{ background: {GREEN}; }}
+
+/* ── BLAST-RADIUS PANEL ─────────────────────────────────── */
+.blast-toolbar {{
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+  padding: 4px 2px 10px; border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 8px;
+}}
+.blast-toolbar__label {{
+  font-size: 0.68rem; font-weight: 800; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-muted);
+}}
+.blast-toolbar .Select-control {{ min-height: 30px; }}
+.blast-anchor-wrap {{ min-width: 260px; flex: 0 0 280px; }}
+.blast-chips {{ display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }}
+.cat-chip {{
+  border: 1px solid var(--border-bright);
+  background: var(--bg-tile); color: var(--text-secondary);
+  padding: 2px 8px; border-radius: 999px;
+  font-size: 0.7rem; font-weight: 700;
+  cursor: pointer; font-family: inherit;
+  transition: all 120ms ease;
+}}
+.cat-chip:hover {{ border-color: var(--c-purple); color: var(--text-primary); }}
+.cat-chip--active {{
+  background: var(--c-purple); color: white; border-color: transparent;
+}}
+.risk-toggle {{ display: inline-flex; gap: 0; border: 1px solid var(--border-bright);
+                border-radius: 6px; overflow: hidden; }}
+.risk-toggle__btn {{
+  background: var(--bg-tile); color: var(--text-secondary);
+  border: 0; padding: 4px 10px; font-size: 0.72rem; font-weight: 700;
+  cursor: pointer; font-family: inherit;
+}}
+.risk-toggle__btn--active {{ background: var(--c-purple); color: white; }}
+.blast-legend {{ display: flex; gap: 12px; font-size: 0.72rem; color: var(--text-muted); }}
+.blast-legend__sw {{
+  display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+  margin-right: 4px; vertical-align: middle;
+}}
+.blast-graph-wrap {{
+  position: relative;
+  border: 1px solid var(--border-subtle); border-radius: 8px;
+  background: radial-gradient(circle at 50% 45%, rgba(124,92,255,0.10) 0%, rgba(11,18,41,0) 60%),
+              var(--bg-tile);
+}}
+.blast-inspector {{
+  position: absolute; bottom: 10px; right: 10px; max-width: 290px;
+  background: rgba(11,18,41,0.92); border: 1px solid var(--border-bright);
+  border-radius: 8px; padding: 10px 12px; font-size: 0.78rem;
+  color: var(--text-primary); box-shadow: 0 6px 18px rgba(0,0,0,0.45);
+  backdrop-filter: blur(6px);
+}}
+.blast-inspector__title {{ font-weight: 800; color: var(--c-teal); margin-bottom: 4px; }}
+.blast-inspector__row  {{ display: flex; justify-content: space-between; gap: 12px;
+                          padding: 1px 0; color: var(--text-secondary); }}
+.blast-inspector__row b {{ color: var(--text-primary); }}
+.blast-inspector__pill {{
+  display: inline-block; padding: 1px 7px; border-radius: 999px;
+  font-size: 0.66rem; font-weight: 800; text-transform: uppercase;
+  letter-spacing: 0.05em;
+}}
+.blast-inspector__pill--critical {{ background: {RED_ALERT}; color: white; }}
+.blast-inspector__pill--warning  {{ background: {ORANGE_ALERT}; color: white; }}
+.blast-inspector__pill--healthy  {{ background: {GREEN}; color: white; }}
+.blast-empty {{ position: absolute; inset: 0; display: flex; align-items: center;
+                justify-content: center; color: var(--text-muted); font-size: 0.85rem; }}
 
 .count-pill {{
   display: inline-flex; align-items: center; gap: 6px;
@@ -939,24 +1188,95 @@ def legend():
     )
 
 
+BLAST_CYTOSCAPE_STYLESHEET = [
+    # Defaults
+    {"selector": "node", "style": {
+        "label": "data(label)",
+        "color": "#E6EEFB", "font-size": "10px", "font-family": "Lato, sans-serif",
+        "text-valign": "bottom", "text-halign": "center", "text-margin-y": 6,
+        "text-outline-color": "#0B1229", "text-outline-width": 2,
+        "background-color": "#7C5CFF",
+        "width":  "mapData(criticality, 1, 3, 44, 22)",
+        "height": "mapData(criticality, 1, 3, 44, 22)",
+        "border-width": 2, "border-color": "rgba(255,255,255,0.25)",
+        "transition-property": "background-color, border-color, opacity, width, height",
+        "transition-duration": "180ms",
+    }},
+    # Risk status colors
+    {"selector": "node.node-critical", "style": {
+        "background-color": "#EF4444", "border-color": "#FCA5A5",
+    }},
+    {"selector": "node.node-warning", "style": {
+        "background-color": "#F97316", "border-color": "#FED7AA",
+    }},
+    {"selector": "node.node-healthy", "style": {
+        "background-color": "#22C55E", "border-color": "rgba(255,255,255,0.35)",
+    }},
+    # Anchor node — larger + pulsing purple ring
+    {"selector": "node.anchor", "style": {
+        "border-width": 6, "border-color": "#7C5CFF",
+        "width":  "mapData(criticality, 1, 3, 64, 40)",
+        "height": "mapData(criticality, 1, 3, 64, 40)",
+        "font-size": "12px",
+        "color": "#FFFFFF",
+    }},
+    # P1 / patient-safety halo
+    {"selector": "node.has-p1", "style": {
+        "shadow-blur": 18, "shadow-color": "#EF4444", "shadow-opacity": 0.9,
+    }},
+    # Dim faded nodes when hovering / focusing
+    {"selector": "node.faded", "style": {"opacity": 0.12}},
+    {"selector": "edge.faded", "style": {"opacity": 0.04}},
+    # 1-hop emphasis
+    {"selector": "node.hop1", "style": {
+        "border-width": 4, "border-color": "#14B8A6",
+    }},
+    {"selector": "node.hop2", "style": {
+        "border-width": 3, "border-color": "rgba(20,184,166,0.55)",
+    }},
+    # Edges
+    {"selector": "edge", "style": {
+        "curve-style": "bezier",
+        "width": "data(thickness)",
+        "line-color": "rgba(124,92,255,0.35)",
+        "target-arrow-color": "rgba(124,92,255,0.55)",
+        "target-arrow-shape": "triangle",
+        "arrow-scale": 0.8,
+        "opacity": 0.85,
+        "transition-property": "line-color, opacity, width",
+        "transition-duration": "180ms",
+    }},
+    {"selector": "edge.hop1", "style": {
+        "line-color": "#14B8A6", "target-arrow-color": "#14B8A6", "opacity": 1.0,
+    }},
+    {"selector": "edge.hop2", "style": {
+        "line-color": "rgba(20,184,166,0.45)", "target-arrow-color": "rgba(20,184,166,0.55)",
+    }},
+]
+
+
 app.layout = html.Div([
     dcc.Interval(id="interval-refresh", interval=30_000, n_intervals=0),
     dcc.Store(id="incidents-store"),
     dcc.Store(id="selected-unit-store", data=None),
     dcc.Store(id="selected-tier-store", data=None),
+    dcc.Store(id="blast-anchor-store", data=None),
+    dcc.Store(id="blast-categories-store", data=[]),
+    dcc.Store(id="blast-risk-mode-store", data="incident_load"),
 
     header(),
     legend(),
 
     html.Div([
+        # Row 1: compact floor map + wide active incidents
         dbc.Row([
             dbc.Col(html.Div([
                 html.Div([
-                    html.H6("Hospital Floor Map", className="panel__title"),
-                    html.Span("Click a unit to filter", style={"fontSize": "0.78rem", "color": TEXT_MUTED}),
+                    html.H6("Floor Map", className="panel__title"),
+                    html.Span("Click to filter", style={"fontSize": "0.72rem", "color": TEXT_MUTED}),
                 ], className="panel__header"),
                 html.Div(html.Div(id="floor-map-container"), className="panel__body"),
-            ], className="panel"), md=6, className="mb-3"),
+            ], className="panel"), md=3, className="mb-3"),
 
             dbc.Col(html.Div([
                 html.Div([
@@ -975,22 +1295,82 @@ app.layout = html.Div([
                     html.Div(id="filter-banner-container"),
                     html.Div(id="incidents-table-container", style={"maxHeight": "360px", "overflowY": "auto"}),
                 ], className="panel__body"),
-            ], className="panel"), md=6, className="mb-3"),
+            ], className="panel"), md=9, className="mb-3"),
         ]),
 
+        # Row 2: hero blast-radius graph (full width)
+        dbc.Row([
+            dbc.Col(html.Div([
+                html.Div([
+                    html.H6("System Blast Radius — CMDB Dependency Graph",
+                            className="panel__title"),
+                    html.Span("Hover dims · click to recenter · double-click to clear",
+                              style={"fontSize": "0.72rem", "color": TEXT_MUTED}),
+                ], className="panel__header"),
+                html.Div([
+                    html.Div([
+                        html.Span("Anchor", className="blast-toolbar__label"),
+                        html.Div(dcc.Dropdown(id="blast-anchor-dropdown",
+                                              placeholder="Center on a system...",
+                                              clearable=True),
+                                 className="blast-anchor-wrap"),
+                        html.Span("Category", className="blast-toolbar__label"),
+                        html.Div(id="blast-category-chips", className="blast-chips"),
+                        html.Span("Risk mode", className="blast-toolbar__label"),
+                        html.Div([
+                            html.Button("Incident load",   id={"type":"risk-mode","mode":"incident_load"},
+                                        n_clicks=0, className="risk-toggle__btn risk-toggle__btn--active"),
+                            html.Button("Patient safety",  id={"type":"risk-mode","mode":"patient_safety"},
+                                        n_clicks=0, className="risk-toggle__btn"),
+                            html.Button("P1 / major",      id={"type":"risk-mode","mode":"p1_major"},
+                                        n_clicks=0, className="risk-toggle__btn"),
+                        ], className="risk-toggle"),
+                        html.Div([
+                            html.Span([html.Span(className="blast-legend__sw",
+                                                 style={"background": RED_ALERT}), "Critical"]),
+                            html.Span([html.Span(className="blast-legend__sw",
+                                                 style={"background": ORANGE_ALERT}), "Warning"]),
+                            html.Span([html.Span(className="blast-legend__sw",
+                                                 style={"background": GREEN}), "Healthy"]),
+                        ], className="blast-legend", style={"marginLeft":"auto"}),
+                    ], className="blast-toolbar"),
+
+                    html.Div([
+                        cyto.Cytoscape(
+                            id="blast-cyto",
+                            elements=[],
+                            stylesheet=BLAST_CYTOSCAPE_STYLESHEET,
+                            layout={"name": "cose-bilkent", "animate": False,
+                                    "idealEdgeLength": 110, "nodeRepulsion": 8500,
+                                    "edgeElasticity": 0.45, "gravity": 0.25,
+                                    "numIter": 2500, "padding": 30,
+                                    "randomize": False, "fit": True},
+                            style={"width": "100%", "height": "560px"},
+                            minZoom=0.3, maxZoom=2.2,
+                            wheelSensitivity=0.18,
+                            autoungrabify=False,
+                        ),
+                        html.Div(id="blast-inspector", className="blast-inspector",
+                                 children="Click a node for details."),
+                    ], className="blast-graph-wrap"),
+                ], className="panel__body"),
+            ], className="panel"), md=12, className="mb-3"),
+        ]),
+
+        # Row 3: MTTR + recent pages
         dbc.Row([
             dbc.Col(html.Div([
                 html.Div(html.H6("Mean Time To Resolve (MTTR) — by Floor Unit · Last 30 Days",
                                  id="mttr-title", className="panel__title"),
                          className="panel__header"),
                 html.Div(dcc.Graph(id="mttr-chart", config={"displayModeBar": False}), className="panel__body"),
-            ], className="panel"), md=7, className="mb-3"),
+            ], className="panel"), md=8, className="mb-3"),
 
             dbc.Col(html.Div([
                 html.Div(html.H6("Recent Page Actions", className="panel__title"), className="panel__header"),
                 html.Div(html.Div(id="recent-pages-container", style={"maxHeight": "300px", "overflowY": "auto"}),
                          className="panel__body"),
-            ], className="panel"), md=5, className="mb-3"),
+            ], className="panel"), md=4, className="mb-3"),
         ]),
     ], className="page-body"),
 
@@ -1326,6 +1706,275 @@ def update_selected_filters(_tile_clicks, _tier_clicks, _clear_clicks,
         clicked = chip_id.get("tier")
         return no_update, (None if clicked == current_tier else clicked)
     return no_update, no_update
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BLAST RADIUS GRAPH — callbacks
+# ─────────────────────────────────────────────────────────────────────────────
+_BLAST_CACHE = {"nodes": None, "edges": None, "ts": None}
+
+
+def _load_blast(force=False):
+    now = datetime.now(timezone.utc)
+    if not force and _BLAST_CACHE["nodes"] is not None and _BLAST_CACHE["ts"] and \
+            (now - _BLAST_CACHE["ts"]).total_seconds() < 60:
+        return _BLAST_CACHE["nodes"], _BLAST_CACHE["edges"]
+    try:
+        nodes, edges = get_dependency_blast_radius()
+    except Exception as e:
+        print(f"Blast radius load error: {e}")
+        nodes, edges = [], []
+    _BLAST_CACHE["nodes"], _BLAST_CACHE["edges"], _BLAST_CACHE["ts"] = nodes, edges, now
+    return nodes, edges
+
+
+def _default_anchor_id(nodes):
+    for n in nodes:
+        if n["data"]["name"] == "Epic Hyperspace - Production":
+            return n["data"]["id"]
+    return nodes[0]["data"]["id"] if nodes else None
+
+
+@callback(
+    [Output("blast-anchor-dropdown", "options"),
+     Output("blast-category-chips", "children")],
+    [Input("interval-refresh", "n_intervals"),
+     Input("blast-categories-store", "data")],
+)
+def populate_blast_controls(_n, categories):
+    nodes, _ = _load_blast()
+    sorted_nodes = sorted(
+        nodes,
+        key=lambda n: (n["data"]["criticality"], -n["data"]["incident_count"], n["data"]["name"]),
+    )
+    options = [
+        {"label": f"{n['data']['name']}  ·  {n['data']['category']}",
+         "value": n["data"]["id"]}
+        for n in sorted_nodes
+    ]
+    active_cats = set(categories or [])
+    chips = []
+    for bid, (label, _pred) in DEP_CATEGORY_BUCKETS.items():
+        cls = "cat-chip" + (" cat-chip--active" if bid in active_cats else "")
+        chips.append(html.Button(
+            label, id={"type": "blast-cat", "bucket": bid}, n_clicks=0, className=cls,
+        ))
+    chips.append(html.Button(
+        "Reset", id={"type": "blast-cat", "bucket": "__reset__"}, n_clicks=0,
+        className="cat-chip", style={"marginLeft": "6px", "fontStyle": "italic"},
+    ))
+    return options, chips
+
+
+@callback(
+    Output("blast-categories-store", "data"),
+    Input({"type": "blast-cat", "bucket": ALL}, "n_clicks"),
+    State("blast-categories-store", "data"),
+    prevent_initial_call=True,
+)
+def toggle_blast_category(_clicks, current):
+    import json as _json
+    if not ctx.triggered:
+        return no_update
+    real = next((t for t in ctx.triggered if t.get("value")), None)
+    if not real:
+        return no_update
+    try:
+        cid = _json.loads(real["prop_id"].rsplit(".", 1)[0])
+    except Exception:
+        return no_update
+    bucket = cid.get("bucket")
+    if bucket == "__reset__":
+        return []
+    current = list(current or [])
+    if bucket in current:
+        current.remove(bucket)
+    else:
+        current.append(bucket)
+    return current
+
+
+@callback(
+    Output("blast-risk-mode-store", "data"),
+    Input({"type": "risk-mode", "mode": ALL}, "n_clicks"),
+    State("blast-risk-mode-store", "data"),
+    prevent_initial_call=True,
+)
+def toggle_risk_mode(_clicks, current):
+    import json as _json
+    if not ctx.triggered:
+        return no_update
+    real = next((t for t in ctx.triggered if t.get("value")), None)
+    if not real:
+        return no_update
+    try:
+        rid = _json.loads(real["prop_id"].rsplit(".", 1)[0])
+    except Exception:
+        return no_update
+    return rid.get("mode") or current
+
+
+@callback(
+    Output({"type": "risk-mode", "mode": ALL}, "className"),
+    Input("blast-risk-mode-store", "data"),
+    State({"type": "risk-mode", "mode": ALL}, "id"),
+)
+def style_risk_mode_buttons(mode, ids):
+    out = []
+    for i in ids or []:
+        cls = "risk-toggle__btn"
+        if (i or {}).get("mode") == (mode or "incident_load"):
+            cls += " risk-toggle__btn--active"
+        out.append(cls)
+    return out
+
+
+@callback(
+    Output("blast-anchor-store", "data"),
+    [Input("blast-anchor-dropdown", "value"),
+     Input("blast-cyto", "tapNodeData")],
+    prevent_initial_call=True,
+)
+def update_blast_anchor(dropdown_val, tap_node):
+    # whichever fired last wins (Dash uses ctx)
+    if not ctx.triggered:
+        return no_update
+    trig = ctx.triggered[0]["prop_id"]
+    if trig.startswith("blast-cyto"):
+        return (tap_node or {}).get("id") or no_update
+    return dropdown_val
+
+
+def _restyle_for_risk(node, mode):
+    """Recompute status class based on the selected risk mode without
+    rebuilding the whole node list."""
+    d = node["data"]
+    if mode == "patient_safety":
+        score = 100 if d["patient_safety"] > 0 else (40 if d["incident_count"] > 0 else 0)
+    elif mode == "p1_major":
+        score = 100 if d["p1_count"] > 0 else (60 if d["major_count"] > 0 else (20 if d["incident_count"] > 0 else 0))
+    else:  # incident_load (default)
+        score = d["risk_score"]
+    if score >= 80: status = "critical"
+    elif score >= 35: status = "warning"
+    else: status = "healthy"
+    classes = []
+    base = (node.get("classes") or "").split()
+    for c in base:
+        if not c.startswith("node-"):
+            classes.append(c)
+    classes.append(f"node-{status}")
+    new = {"data": dict(d), "classes": " ".join(classes)}
+    new["data"]["status"] = status
+    return new
+
+
+@callback(
+    Output("blast-cyto", "elements"),
+    [Input("interval-refresh", "n_intervals"),
+     Input("blast-anchor-store", "data"),
+     Input("blast-categories-store", "data"),
+     Input("blast-risk-mode-store", "data")],
+)
+def render_blast(_n, anchor, categories, risk_mode):
+    nodes_all, edges_all = _load_blast()
+    if not nodes_all:
+        return []
+
+    # Fall back to Epic Hyperspace as the default anchor.
+    if anchor is None:
+        anchor = _default_anchor_id(nodes_all)
+
+    # Category filter: when one or more buckets are selected, hide nodes not
+    # in those buckets (but always keep the anchor visible for context).
+    active = set(categories or [])
+    if active:
+        visible_ids = {n["data"]["id"] for n in nodes_all if n["data"]["bucket"] in active}
+        if anchor:
+            visible_ids.add(anchor)
+    else:
+        visible_ids = {n["data"]["id"] for n in nodes_all}
+
+    nodes_vis = [_restyle_for_risk(n, risk_mode) for n in nodes_all if n["data"]["id"] in visible_ids]
+    edges_vis = [e for e in edges_all
+                 if e["data"]["source"] in visible_ids and e["data"]["target"] in visible_ids]
+
+    if anchor:
+        # Mark the anchor + collect hops
+        for n in nodes_vis:
+            if n["data"]["id"] == anchor:
+                n["classes"] = (n.get("classes") or "") + " anchor"
+        hop1 = set()
+        for e in edges_vis:
+            if e["data"]["source"] == anchor: hop1.add(e["data"]["target"])
+            if e["data"]["target"] == anchor: hop1.add(e["data"]["source"])
+        hop2 = set()
+        for e in edges_vis:
+            if (e["data"]["source"] in hop1 and e["data"]["target"] != anchor
+                    and e["data"]["target"] not in hop1):
+                hop2.add(e["data"]["target"])
+            if (e["data"]["target"] in hop1 and e["data"]["source"] != anchor
+                    and e["data"]["source"] not in hop1):
+                hop2.add(e["data"]["source"])
+        for n in nodes_vis:
+            nid = n["data"]["id"]
+            if nid == anchor: continue
+            if nid in hop1:
+                n["classes"] = (n.get("classes") or "") + " hop1"
+            elif nid in hop2:
+                n["classes"] = (n.get("classes") or "") + " hop2"
+            else:
+                n["classes"] = (n.get("classes") or "") + " faded"
+        for e in edges_vis:
+            src, tgt = e["data"]["source"], e["data"]["target"]
+            if anchor in (src, tgt):
+                e["classes"] = "hop1"
+            elif src in hop1 and tgt in hop1:
+                e["classes"] = "hop2"
+            elif src in hop1 or tgt in hop1:
+                e["classes"] = "hop2"
+            else:
+                e["classes"] = "faded"
+
+    return nodes_vis + edges_vis
+
+
+@callback(
+    Output("blast-inspector", "children"),
+    [Input("blast-cyto", "tapNodeData"),
+     Input("blast-anchor-store", "data")],
+)
+def render_inspector(tap, anchor):
+    nodes, edges = _load_blast()
+    target_id = (tap or {}).get("id") or anchor
+    if not target_id:
+        return "Click a node for details."
+    node = next((n for n in nodes if n["data"]["id"] == target_id), None)
+    if not node:
+        return "Click a node for details."
+    d = node["data"]
+    pill_cls = f"blast-inspector__pill blast-inspector__pill--{d['status']}"
+    upstream = [e for e in edges if e["data"]["target"] == d["id"]]
+    downstream = [e for e in edges if e["data"]["source"] == d["id"]]
+    return html.Div([
+        html.Div(d["name"], className="blast-inspector__title"),
+        html.Div([
+            html.Span(d["status"].upper(), className=pill_cls),
+            html.Span(d["category"], style={"marginLeft": "6px", "color": TEXT_MUTED}),
+        ], style={"marginBottom": "6px"}),
+        html.Div([html.Span("Active incidents"), html.B(str(d["incident_count"]))],
+                 className="blast-inspector__row"),
+        html.Div([html.Span("P1 active"), html.B(str(d["p1_count"]))],
+                 className="blast-inspector__row"),
+        html.Div([html.Span("Patient-safety"), html.B(str(d["patient_safety"]))],
+                 className="blast-inspector__row"),
+        html.Div([html.Span("Criticality"), html.B(d.get("service_tier") or "—")],
+                 className="blast-inspector__row"),
+        html.Div([html.Span("Depends on"), html.B(str(len(downstream)))],
+                 className="blast-inspector__row"),
+        html.Div([html.Span("Depended on by"), html.B(str(len(upstream)))],
+                 className="blast-inspector__row"),
+    ])
 
 
 DARK_PLOT_LAYOUT = dict(
