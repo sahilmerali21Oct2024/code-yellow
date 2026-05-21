@@ -426,7 +426,7 @@ def build_floor_map(incidents, selected_unit):
         info = status.get(uid)
         tier = info["tier"] if info else None
         count = info["count"] if info else 0
-        bg = TIER_COLORS.get(tier, GRAY_INACTIVE) if tier else "#FFFFFF"
+        bg = TIER_COLORS.get(tier, GRAY_INACTIVE) if tier else BG_TILE
         text_color = "white" if tier else TEXT_PRIMARY
         is_pulse = tier == "life-safety"
         is_selected = selected_unit == uid
@@ -1097,10 +1097,15 @@ def render_filter_banner(selected_unit, total_visible, total_overall):
 )
 def refresh_data(_n, selected_unit):
     try:
-        incidents = get_active_incidents()
+        all_incidents = get_active_incidents()
     except Exception as e:
-        incidents = []
+        all_incidents = []
         print(f"Error fetching incidents: {e}")
+
+    # Scope the entire dashboard to incidents that map to a tile on the
+    # hospital floor map. Infrastructure / unmapped incidents are excluded
+    # from counts, list, floor-tile badges, and the MTTR chart.
+    incidents = [i for i in all_incidents if i.get("affected_unit") in UNIT_NAME_BY_ID]
 
     floor_map = build_floor_map(incidents, selected_unit)
 
@@ -1241,7 +1246,12 @@ def update_mttr_chart(_n, selected_unit):
 
     df = pd.DataFrame(data)
     df["unit_id"] = df["location_name"].apply(get_unit_from_location)
-    df["unit"] = df["unit_id"].map(lambda u: UNIT_NAME_BY_ID.get(u, "Other"))
+    # Scope to incidents that map to a tile on the hospital floor map. Drop
+    # unmapped infrastructure incidents entirely (no "Other" line).
+    df = df[df["unit_id"].isin(UNIT_NAME_BY_ID.keys())]
+    if df.empty:
+        return _empty_mttr_fig("No MTTR data available"), base_title
+    df["unit"] = df["unit_id"].map(UNIT_NAME_BY_ID)
 
     # Re-aggregate to per-(unit, date) so we get one line per floor unit
     # rather than per raw location_name.
@@ -1260,9 +1270,9 @@ def update_mttr_chart(_n, selected_unit):
 
     # Stable color order matching floor-map tile order, so each unit gets the
     # same color in the chart that it has on the map.
-    unit_order = [u["name"] for u in HOSPITAL_UNITS] + ["Other"]
+    unit_order = [u["name"] for u in HOSPITAL_UNITS]
     unit_palette = [PURPLE, TEAL, GREEN, ORANGE_ALERT, RED_ALERT,
-                    BLUE, AMBER, "#EC4899", "#06B6D4", "#A78BFA", "#6B7280"]
+                    BLUE, AMBER, "#EC4899", "#06B6D4", "#A78BFA"]
     color_map = {u: unit_palette[i % len(unit_palette)] for i, u in enumerate(unit_order)}
 
     fig = px.line(
