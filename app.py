@@ -22,6 +22,11 @@ cyto.load_extra_layouts()
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
+GENIE_URL = os.getenv(
+    "GENIE_URL",
+    "https://fevm-classic-stable-q1odfo.cloud.databricks.com/genie/rooms/01f1497305f91728a36e24163f0d10be?o=7474644801528071",
+)
+
 LAKEBASE_PROJECT = "code-yellow"
 LAKEBASE_ENDPOINT = f"projects/{LAKEBASE_PROJECT}/branches/production/endpoints/primary"
 LAKEBASE_DB = "databricks_postgres"
@@ -748,6 +753,46 @@ html, body {{
 
 /* ── CARDS ────────────────────────────────────────────── */
 .page-body {{ padding: 18px 24px; background: var(--bg-page); }}
+.page-layout {{
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}}
+.page-main  {{ min-width: 0; }}
+.page-side  {{
+  position: sticky; top: 12px;
+  height: calc(100vh - 24px);
+  min-width: 0;
+}}
+.genie-panel {{
+  display: flex; flex-direction: column;
+  height: 100%;
+  border: 1px solid var(--border-bright);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  overflow: hidden;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+}}
+.genie-panel__header {{
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: linear-gradient(180deg, rgba(124,92,255,0.10), rgba(124,92,255,0));
+}}
+.genie-panel__title  {{ font-weight: 800; color: var(--text-primary); font-size: 0.92rem; letter-spacing: 0.02em; }}
+.genie-panel__sub    {{ font-size: 0.7rem; color: var(--text-muted); }}
+.genie-panel__open   {{
+  font-size: 0.72rem; color: var(--c-teal); text-decoration: none; font-weight: 700;
+}}
+.genie-panel__open:hover {{ color: white; }}
+.genie-iframe {{
+  flex: 1 1 auto; width: 100%; border: 0; background: var(--bg-panel);
+}}
+@media (max-width: 1280px) {{
+  .page-layout {{ grid-template-columns: 1fr; }}
+  .page-side {{ position: static; height: 620px; }}
+}}
 .panel {{
   background: var(--bg-panel);
   border: 1px solid var(--border-subtle);
@@ -1268,6 +1313,9 @@ app.layout = html.Div([
     legend(),
 
     html.Div([
+      html.Div([
+        # ── LEFT: existing dashboard (2/3) ─────────────────────────
+        html.Div([
         # Row 1: compact floor map + wide active incidents
         dbc.Row([
             dbc.Col(html.Div([
@@ -1372,6 +1420,34 @@ app.layout = html.Div([
                 ], className="panel__body"),
             ], className="panel"), md=12, className="mb-3"),
         ]),
+        ], className="page-main"),
+
+        # ── RIGHT: Genie space (1/3) ───────────────────────────────
+        html.Div([
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.I(className="fas fa-comments me-2",
+                               style={"color": PURPLE}),
+                        html.Span("Ask Genie", className="genie-panel__title"),
+                        html.Div("Natural-language Q&A over the live data",
+                                 className="genie-panel__sub"),
+                    ]),
+                    html.A([html.I(className="fas fa-arrow-up-right-from-square me-1"),
+                            "Open"],
+                           href=GENIE_URL, target="_blank",
+                           className="genie-panel__open"),
+                ], className="genie-panel__header"),
+                html.Iframe(
+                    src=GENIE_URL,
+                    className="genie-iframe",
+                    sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox",
+                    allow="clipboard-read; clipboard-write",
+                ),
+            ], className="genie-panel"),
+        ], className="page-side"),
+
+      ], className="page-layout"),
     ], className="page-body"),
 
     # Page modal
