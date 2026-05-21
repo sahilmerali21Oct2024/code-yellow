@@ -1298,7 +1298,23 @@ app.layout = html.Div([
             ], className="panel"), md=9, className="mb-3"),
         ]),
 
-        # Row 2: hero blast-radius graph (full width)
+        # Row 2: MTTR + recent pages
+        dbc.Row([
+            dbc.Col(html.Div([
+                html.Div(html.H6("Mean Time To Resolve (MTTR) — by Floor Unit · Last 30 Days",
+                                 id="mttr-title", className="panel__title"),
+                         className="panel__header"),
+                html.Div(dcc.Graph(id="mttr-chart", config={"displayModeBar": False}), className="panel__body"),
+            ], className="panel"), md=8, className="mb-3"),
+
+            dbc.Col(html.Div([
+                html.Div(html.H6("Recent Page Actions", className="panel__title"), className="panel__header"),
+                html.Div(html.Div(id="recent-pages-container", style={"maxHeight": "300px", "overflowY": "auto"}),
+                         className="panel__body"),
+            ], className="panel"), md=4, className="mb-3"),
+        ]),
+
+        # Row 3: hero blast-radius graph (full width, at the bottom)
         dbc.Row([
             dbc.Col(html.Div([
                 html.Div([
@@ -1355,22 +1371,6 @@ app.layout = html.Div([
                     ], className="blast-graph-wrap"),
                 ], className="panel__body"),
             ], className="panel"), md=12, className="mb-3"),
-        ]),
-
-        # Row 3: MTTR + recent pages
-        dbc.Row([
-            dbc.Col(html.Div([
-                html.Div(html.H6("Mean Time To Resolve (MTTR) — by Floor Unit · Last 30 Days",
-                                 id="mttr-title", className="panel__title"),
-                         className="panel__header"),
-                html.Div(dcc.Graph(id="mttr-chart", config={"displayModeBar": False}), className="panel__body"),
-            ], className="panel"), md=8, className="mb-3"),
-
-            dbc.Col(html.Div([
-                html.Div(html.H6("Recent Page Actions", className="panel__title"), className="panel__header"),
-                html.Div(html.Div(id="recent-pages-container", style={"maxHeight": "300px", "overflowY": "auto"}),
-                         className="panel__body"),
-            ], className="panel"), md=4, className="mb-3"),
         ]),
     ], className="page-body"),
 
