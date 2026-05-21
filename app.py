@@ -32,7 +32,7 @@ GENIE_WORKSPACE = os.getenv(
 # /genie/rooms/<id> URL is X-Frame-Options: DENY and cannot be iframed.
 GENIE_EMBED_URL = os.getenv(
     "GENIE_EMBED_URL",
-    f"{GENIE_WORKSPACE}/embed/genie/rooms/{GENIE_SPACE_ID}?o=7474644801528071",
+    f"{GENIE_WORKSPACE}/embed/genie/rooms/{GENIE_SPACE_ID}?o=7474644801528071&theme=light",
 )
 GENIE_URL = os.getenv(
     "GENIE_URL",
@@ -890,8 +890,18 @@ html, body {{
 }}
 .genie-panel__open:hover {{ color: white; }}
 .genie-iframe {{
-  flex: 1 1 auto; width: 100%; border: 0; background: var(--bg-panel);
+  flex: 1 1 auto; width: 100%; border: 0; background: #FFFFFF;
+  color-scheme: light;
 }}
+.genie-panel {{ background: #FFFFFF; }}
+.genie-panel__header {{
+  background: linear-gradient(180deg, #F4F1FF, #FFFFFF);
+  color: #1F2937; border-bottom-color: #E5E7EB;
+}}
+.genie-panel__title  {{ color: #111827 !important; }}
+.genie-panel__sub    {{ color: #6B7280 !important; }}
+.genie-panel__open   {{ color: #7C5CFF !important; }}
+.genie-panel__open:hover {{ color: #5B3FE3 !important; }}
 .genie-chat__messages {{
   flex: 1 1 auto; overflow-y: auto;
   padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;
