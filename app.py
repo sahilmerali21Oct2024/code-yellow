@@ -241,20 +241,26 @@ def get_active_incidents():
 
 
 def get_mttr_by_unit():
+    """Return one row per (location, resolve_date, derived tier) so we can
+    filter the MTTR chart by the same impact tier the rest of the app uses."""
     sql = """
         SELECT
             l.name AS location_name,
             DATE(i.resolved_at) AS resolve_date,
-            AVG(EXTRACT(EPOCH FROM (i.resolved_at - i.opened_at)) / 3600) AS mttr_hours
+            i.priority, i.impact, i.u_patient_safety_impact,
+            c.is_clinical,
+            EXTRACT(EPOCH FROM (i.resolved_at - i.opened_at)) / 3600 AS mttr_hours
         FROM service_now.synced_incident i
         LEFT JOIN service_now.synced_cmn_location l ON i.location = l.sys_id
+        LEFT JOIN service_now.synced_cmdb_ci      c ON i.cmdb_ci  = c.sys_id
         WHERE i.resolved_at IS NOT NULL
           AND i.resolved_at >= NOW() - INTERVAL '30 days'
           AND l.name IS NOT NULL
-        GROUP BY l.name, DATE(i.resolved_at)
-        ORDER BY resolve_date ASC
     """
-    return query_db(sql)
+    rows = query_db(sql)
+    for r in rows:
+        r["clinical_impact_tier"] = classify_clinical_impact(r)
+    return rows
 
 
 def get_assignment_groups():
@@ -641,6 +647,47 @@ html, body {{
 .tier-pill--care-delivery {{ background: {ORANGE_ALERT}; }}
 .tier-pill--administrative {{ background: {GREEN}; }}
 
+/* ── TIER FILTER CHIPS (toggle row above the incidents list) ── */
+.tier-chip-bar {{
+  display: flex; flex-wrap: wrap; gap: 6px;
+  padding: 8px 2px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 6px;
+  align-items: center;
+}}
+.tier-chip-bar__label {{
+  font-size: 0.68rem; font-weight: 800; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-muted); margin-right: 4px;
+}}
+.tier-chip {{
+  border: 1px solid var(--border-bright);
+  background: var(--bg-tile);
+  color: var(--text-secondary);
+  padding: 3px 10px 3px 8px; border-radius: 999px;
+  font-size: 0.74rem; font-weight: 700;
+  display: inline-flex; align-items: center; gap: 6px;
+  cursor: pointer; transition: all 120ms ease;
+  font-family: inherit;
+}}
+.tier-chip:hover {{ border-color: var(--c-purple); color: var(--text-primary); }}
+.tier-chip__dot {{
+  width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+}}
+.tier-chip__count {{
+  margin-left: 4px; padding: 0 6px; border-radius: 999px;
+  background: rgba(255,255,255,0.06); color: var(--text-muted);
+  font-size: 0.68rem; font-weight: 800;
+}}
+.tier-chip--active {{
+  color: white; border-color: transparent;
+}}
+.tier-chip--active .tier-chip__count {{
+  background: rgba(255,255,255,0.22); color: white;
+}}
+.tier-chip--life-safety.tier-chip--active    {{ background: {RED_ALERT}; }}
+.tier-chip--care-delivery.tier-chip--active  {{ background: {ORANGE_ALERT}; }}
+.tier-chip--administrative.tier-chip--active {{ background: {GREEN}; }}
+
 .count-pill {{
   display: inline-flex; align-items: center; gap: 6px;
   background: var(--c-purple); color: white;
@@ -896,6 +943,7 @@ app.layout = html.Div([
     dcc.Interval(id="interval-refresh", interval=30_000, n_intervals=0),
     dcc.Store(id="incidents-store"),
     dcc.Store(id="selected-unit-store", data=None),
+    dcc.Store(id="selected-tier-store", data=None),
 
     header(),
     legend(),
@@ -923,6 +971,7 @@ app.layout = html.Div([
                     ]),
                 ], className="panel__header"),
                 html.Div([
+                    html.Div(id="tier-filter-bar", className="tier-chip-bar"),
                     html.Div(id="filter-banner-container"),
                     html.Div(id="incidents-table-container", style={"maxHeight": "360px", "overflowY": "auto"}),
                 ], className="panel__body"),
@@ -1064,20 +1113,60 @@ def render_incidents_list(incidents):
     )
 
 
-def render_filter_banner(selected_unit, total_visible, total_overall):
+TIER_ORDER = [
+    ("life-safety",   "Life-Safety"),
+    ("care-delivery", "Care-Delivery"),
+    ("administrative","Administrative"),
+]
+
+
+def render_tier_chip_bar(tier_counts, selected_tier):
+    """Render a strip of tier-filter chips with live counts. Returns a list of
+    children for the tier-filter-bar Div."""
+    chips = [html.Span("Filter:", className="tier-chip-bar__label")]
+    for tier_id, label in TIER_ORDER:
+        cnt = tier_counts.get(tier_id, 0)
+        cls = f"tier-chip tier-chip--{tier_id}"
+        if selected_tier == tier_id:
+            cls += " tier-chip--active"
+        chips.append(html.Button(
+            [
+                html.Span(className=f"tier-chip__dot tier-pill--{tier_id}"),
+                html.Span(label),
+                html.Span(str(cnt), className="tier-chip__count"),
+            ],
+            id={"type": "tier-chip", "tier": tier_id},
+            n_clicks=0,
+            className=cls,
+            title=f"Click to show only {label} incidents — click again to clear.",
+        ))
+    return chips
+
+
+def render_filter_banner(selected_unit, selected_tier, total_visible, total_overall):
     """Returns (banner_children, clear_btn_style)."""
-    if not selected_unit:
+    if not selected_unit and not selected_tier:
         return None, {"display": "none"}
-    name = UNIT_NAME_BY_ID.get(selected_unit, selected_unit)
+    chips = []
+    if selected_unit:
+        chips.append(html.Span([
+            html.I(className="fas fa-map-marker-alt me-1"),
+            "Unit: ", html.Strong(UNIT_NAME_BY_ID.get(selected_unit, selected_unit)),
+        ], style={"marginRight": "10px"}))
+    if selected_tier:
+        tier_label = dict(TIER_ORDER).get(selected_tier, selected_tier)
+        chips.append(html.Span([
+            html.I(className="fas fa-bolt me-1"),
+            "Impact: ", html.Strong(tier_label),
+        ], style={"marginRight": "10px"}))
     banner = html.Div([
         html.Span([
             html.I(className="fas fa-filter me-2"),
-            html.Span("Filtered by unit: "),
-            html.Strong(name),
-            html.Span(f"  ·  {total_visible} of {total_overall} incidents",
-                      style={"marginLeft": "8px", "color": TEXT_MUTED}),
+            *chips,
+            html.Span(f"·  {total_visible} of {total_overall} incidents",
+                      style={"marginLeft": "4px", "color": TEXT_MUTED}),
         ]),
-        html.Span("Click the tile again or use Clear to reset.",
+        html.Span("Click an active chip/tile again or use Clear to reset.",
                   style={"fontSize": "0.78rem", "color": TEXT_MUTED, "fontStyle": "italic"}),
     ], className="filter-banner")
     return banner, {"display": "inline-block"}
@@ -1091,11 +1180,13 @@ def render_filter_banner(selected_unit, total_visible, total_overall):
      Output("active-count-badge", "children"),
      Output("current-time", "children"),
      Output("incidents-store", "data"),
-     Output("recent-pages-container", "children")],
+     Output("recent-pages-container", "children"),
+     Output("tier-filter-bar", "children")],
     [Input("interval-refresh", "n_intervals"),
-     Input("selected-unit-store", "data")],
+     Input("selected-unit-store", "data"),
+     Input("selected-tier-store", "data")],
 )
-def refresh_data(_n, selected_unit):
+def refresh_data(_n, selected_unit, selected_tier):
     try:
         all_incidents = get_active_incidents()
     except Exception as e:
@@ -1109,16 +1200,36 @@ def refresh_data(_n, selected_unit):
 
     floor_map = build_floor_map(incidents, selected_unit)
 
-    visible_incidents = [i for i in incidents if (not selected_unit or i.get("affected_unit") == selected_unit)]
+    # Tier counts are computed on the unit-filtered set so the chip counts
+    # reflect what's actually relevant when a unit is also selected.
+    unit_scoped = [i for i in incidents if (not selected_unit or i.get("affected_unit") == selected_unit)]
+    tier_counts = {tid: 0 for tid, _ in TIER_ORDER}
+    for i in unit_scoped:
+        t = i.get("clinical_impact_tier")
+        if t in tier_counts:
+            tier_counts[t] += 1
+
+    visible_incidents = [
+        i for i in unit_scoped
+        if (not selected_tier or i.get("clinical_impact_tier") == selected_tier)
+    ]
     if visible_incidents:
         table = render_incidents_list(visible_incidents)
-    elif selected_unit:
-        table = html.Div(f"No active incidents for {UNIT_NAME_BY_ID.get(selected_unit, selected_unit)}.",
+    elif selected_unit or selected_tier:
+        scope_bits = []
+        if selected_unit:
+            scope_bits.append(UNIT_NAME_BY_ID.get(selected_unit, selected_unit))
+        if selected_tier:
+            scope_bits.append(dict(TIER_ORDER).get(selected_tier, selected_tier))
+        table = html.Div(f"No active incidents for {' · '.join(scope_bits)}.",
                          className="empty-state")
     else:
         table = html.Div("No active incidents.", className="empty-state")
 
-    banner, clear_btn_style = render_filter_banner(selected_unit, len(visible_incidents), len(incidents))
+    banner, clear_btn_style = render_filter_banner(
+        selected_unit, selected_tier, len(visible_incidents), len(incidents)
+    )
+    tier_chip_bar = render_tier_chip_bar(tier_counts, selected_tier)
 
     life_safety = sum(1 for i in incidents if i["clinical_impact_tier"] == "life-safety")
     total = len(incidents)
@@ -1168,42 +1279,53 @@ def refresh_data(_n, selected_unit):
     except Exception:
         recent_pages = html.Div("No recent pages", className="empty-state")
 
-    return floor_map, table, banner, clear_btn_style, count_badge, now_str, store_data, recent_pages
+    return (floor_map, table, banner, clear_btn_style, count_badge, now_str,
+            store_data, recent_pages, tier_chip_bar)
 
 
 @callback(
-    Output("selected-unit-store", "data"),
+    [Output("selected-unit-store", "data"),
+     Output("selected-tier-store", "data")],
     [Input({"type": "unit-tile", "unit": ALL}, "n_clicks"),
+     Input({"type": "tier-chip", "tier": ALL}, "n_clicks"),
      Input("clear-filter-btn", "n_clicks")],
-    [State("selected-unit-store", "data")],
+    [State("selected-unit-store", "data"),
+     State("selected-tier-store", "data")],
     prevent_initial_call=True,
 )
-def update_selected_unit(_tile_clicks, _clear_clicks, current):
+def update_selected_filters(_tile_clicks, _tier_clicks, _clear_clicks,
+                            current_unit, current_tier):
     # The floor map tiles are rebuilt every refresh interval, which sets their
     # n_clicks back to 0 and fires this callback with value=0. We must ignore
     # those "phantom" triggers and only act on real user clicks (n_clicks > 0).
     if not ctx.triggered:
-        return no_update
+        return no_update, no_update
 
     import json as _json
     real_trigger = next((t for t in ctx.triggered if t.get("value")), None)
     if not real_trigger:
-        return no_update
+        return no_update, no_update
 
     prop_id = real_trigger["prop_id"]
     if prop_id.startswith("clear-filter-btn"):
-        return None
+        return None, None
     if "unit-tile" in prop_id:
         id_part = prop_id.rsplit(".", 1)[0]
         try:
             tile_id = _json.loads(id_part)
         except Exception:
-            return no_update
+            return no_update, no_update
         clicked = tile_id.get("unit")
-        if clicked == current:
-            return None
-        return clicked
-    return no_update
+        return (None if clicked == current_unit else clicked), no_update
+    if "tier-chip" in prop_id:
+        id_part = prop_id.rsplit(".", 1)[0]
+        try:
+            chip_id = _json.loads(id_part)
+        except Exception:
+            return no_update, no_update
+        clicked = chip_id.get("tier")
+        return no_update, (None if clicked == current_tier else clicked)
+    return no_update, no_update
 
 
 DARK_PLOT_LAYOUT = dict(
@@ -1231,9 +1353,10 @@ def _empty_mttr_fig(message):
     [Output("mttr-chart", "figure"),
      Output("mttr-title", "children")],
     [Input("interval-refresh", "n_intervals"),
-     Input("selected-unit-store", "data")],
+     Input("selected-unit-store", "data"),
+     Input("selected-tier-store", "data")],
 )
-def update_mttr_chart(_n, selected_unit):
+def update_mttr_chart(_n, selected_unit, selected_tier):
     base_title = "Mean Time To Resolve (MTTR) — by Floor Unit · Last 30 Days"
     try:
         data = get_mttr_by_unit()
@@ -1253,6 +1376,13 @@ def update_mttr_chart(_n, selected_unit):
         return _empty_mttr_fig("No MTTR data available"), base_title
     df["unit"] = df["unit_id"].map(UNIT_NAME_BY_ID)
 
+    # Apply the same tier filter as the rest of the dashboard.
+    if selected_tier:
+        df = df[df["clinical_impact_tier"] == selected_tier]
+        if df.empty:
+            tier_label = dict(TIER_ORDER).get(selected_tier, selected_tier)
+            return _empty_mttr_fig(f"No resolved {tier_label} incidents in the last 30 days"), base_title
+
     # Re-aggregate to per-(unit, date) so we get one line per floor unit
     # rather than per raw location_name.
     agg = (
@@ -1261,9 +1391,15 @@ def update_mttr_chart(_n, selected_unit):
     )
 
     title = base_title
+    title_bits = []
+    if selected_unit:
+        title_bits.append(UNIT_NAME_BY_ID.get(selected_unit, selected_unit))
+    if selected_tier:
+        title_bits.append(dict(TIER_ORDER).get(selected_tier, selected_tier))
+    if title_bits:
+        title = f"Mean Time To Resolve (MTTR) — {' · '.join(title_bits)} · Last 30 Days"
     if selected_unit:
         unit_name = UNIT_NAME_BY_ID.get(selected_unit, selected_unit)
-        title = f"Mean Time To Resolve (MTTR) — {unit_name} · Last 30 Days"
         agg = agg[agg["unit"] == unit_name]
         if agg.empty:
             return _empty_mttr_fig(f"No resolved incidents for {unit_name} in the last 30 days"), title
