@@ -274,7 +274,9 @@ def get_mttr_by_unit():
         LEFT JOIN service_now.synced_cmn_location l ON i.location = l.sys_id
         LEFT JOIN service_now.synced_cmdb_ci      c ON i.cmdb_ci  = c.sys_id
         WHERE i.resolved_at IS NOT NULL
-          AND i.resolved_at >= NOW() - INTERVAL '30 days'
+          AND i.resolved_at >= (
+                SELECT MAX(resolved_at) FROM service_now.synced_incident
+              ) - INTERVAL '30 days'
           AND l.name IS NOT NULL
     """
     rows = query_db(sql)
